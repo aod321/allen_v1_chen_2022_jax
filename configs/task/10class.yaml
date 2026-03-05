@@ -1,0 +1,11 @@
+# 10-Class Classification Task Configuration
+# Multi-class orientation classification
+
+# Task identifier
+name: 10class
+
+# Number of output classes
+n_classes: 10
+
+# Task description
+description: "10-class orientation classification task"

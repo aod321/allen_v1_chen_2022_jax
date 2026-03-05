@@ -1,0 +1,44 @@
+# Training Configuration
+# Defines optimizer and training hyperparameters
+
+# Number of training epochs
+n_epochs: 100
+
+# Batch size per device
+batch_size: 2
+
+# Sequence length (timesteps)
+seq_len: 600
+
+# Training steps per epoch
+steps_per_epoch: 100
+
+# Validation steps
+val_steps: 20
+
+# =============================================================================
+# Optimizer
+# =============================================================================
+# Learning rate
+learning_rate: 1e-3
+
+# Gradient clipping norm
+gradient_clip_norm: 1.0
+
+# Weight decay (AdamW)
+weight_decay: 0.0
+
+# Warmup steps for learning rate schedule
+warmup_steps: 0
+
+# =============================================================================
+# Regularization
+# =============================================================================
+# Spike rate regularization coefficient
+rate_cost: 0.1
+
+# Voltage regularization coefficient
+voltage_cost: 1e-5
+
+# Weight regularization coefficient
+weight_cost: 0.0

@@ -77,6 +77,7 @@ uv sync
 - JAX 0.4.20+
 - CUDA 12.x (for GPU support)
 - uv (Python package manager)
+- Hydra 1.3+ (configuration management)
 
 ---
 
@@ -108,25 +109,61 @@ spikes = output.spikes      # (600, 32, n_neurons)
 voltages = output.voltages  # (600, 32, n_neurons)
 ```
 
-### Training
+### Training with Hydra
+
+This project uses [Hydra](https://hydra.cc/) for configuration management, enabling hierarchical configs, command-line overrides, and experiment tracking.
 
 ```bash
-# Train with default settings
+# Train with default configuration
+uv run python scripts/train.py data_dir=/path/to/GLIF_network
+
+# Override training parameters
 uv run python scripts/train.py \
-    --data_dir=/path/to/GLIF_network \
-    --results_dir=./results \
-    --batch_size=4 \
-    --n_epochs=16 \
-    --task_name=garrett
+    data_dir=/path/to/GLIF_network \
+    training.learning_rate=1e-4 \
+    training.batch_size=4 \
+    training.n_epochs=100
+
+# Switch task
+uv run python scripts/train.py data_dir=/path/to/GLIF_network task=evidence
 
 # Multi-GPU training
 uv run python scripts/train.py \
-    --data_dir=/path/to/GLIF_network \
-    --results_dir=./results \
-    --batch_size=8 \
-    --n_epochs=100 \
-    --use_pmap
+    data_dir=/path/to/GLIF_network \
+    use_pmap=true
+
+# Enable Weights & Biases logging
+uv run python scripts/train.py \
+    data_dir=/path/to/GLIF_network \
+    wandb.project=v1-cortical-model \
+    wandb.entity=my-team \
+    wandb.tags="[baseline,garrett]"
 ```
+
+### Configuration Structure
+
+```
+configs/
+├── config.yaml           # Main config (imports others via defaults)
+├── network/
+│   └── default.yaml      # Network architecture params
+├── training/
+│   └── default.yaml      # Training hyperparameters
+├── task/
+│   ├── garrett.yaml      # Drifting grating task
+│   ├── evidence.yaml     # Evidence accumulation task
+│   └── 10class.yaml      # 10-class classification
+└── wandb/
+    └── default.yaml      # Wandb logging config (lazy loading)
+```
+
+### Hydra Features
+
+- **Hierarchical configs**: Organize settings by domain (network, training, task)
+- **Command-line overrides**: `training.learning_rate=1e-4`
+- **Config composition**: Switch configs with `task=evidence`
+- **Automatic output directories**: Results saved to timestamped folders
+- **Multirun sweeps**: `--multirun training.learning_rate=1e-3,1e-4,1e-5`
 
 ### TensorFlow Checkpoint Conversion
 
@@ -143,6 +180,19 @@ uv run python scripts/convert_checkpoint.py \
 
 ```
 allen_v1_chen_2022_jax/
+├── configs/                    # Hydra configuration files
+│   ├── config.yaml             # Main config entry point
+│   ├── network/                # Network architecture configs
+│   │   └── default.yaml
+│   ├── training/               # Training hyperparameters
+│   │   └── default.yaml
+│   ├── task/                   # Task-specific configs
+│   │   ├── garrett.yaml
+│   │   ├── evidence.yaml
+│   │   └── 10class.yaml
+│   └── wandb/                  # Wandb logging config
+│       └── default.yaml
+│
 ├── src/v1_jax/
 │   ├── nn/                     # Neural network modules
 │   │   ├── spike_functions.py  # Spike + surrogate gradient
@@ -171,7 +221,7 @@ allen_v1_chen_2022_jax/
 │       └── stim_generator.py   # Stimulus generation
 │
 ├── scripts/
-│   ├── train.py                # Training script
+│   ├── train.py                # Training script (Hydra)
 │   ├── benchmark.py            # Performance benchmarks
 │   └── convert_checkpoint.py   # TF→JAX conversion
 │

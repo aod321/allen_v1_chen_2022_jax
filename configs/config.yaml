@@ -1,0 +1,52 @@
+# V1 Cortical Network Training Configuration
+# Reference: Chen et al., Science Advances 2022
+#
+# Usage:
+#   python scripts/train.py                              # Default config
+#   python scripts/train.py task=evidence                # Switch task
+#   python scripts/train.py training.learning_rate=1e-4  # Override params
+
+defaults:
+  - network: default
+  - training: default
+  - task: garrett
+  - wandb: default
+  - _self_
+
+# =============================================================================
+# Paths
+# =============================================================================
+data_dir: ""
+results_dir: "./results"
+restore_from: ""
+
+# =============================================================================
+# Distributed Training
+# =============================================================================
+num_devices: null  # null = use all available devices
+use_pmap: false
+
+# =============================================================================
+# Checkpointing
+# =============================================================================
+save_interval: 1  # Save checkpoint every N epochs
+max_checkpoints: 10
+
+# =============================================================================
+# Misc
+# =============================================================================
+seed: 42
+max_time: -1  # Max training time in hours (-1 for unlimited)
+
+# =============================================================================
+# Hydra Configuration
+# =============================================================================
+hydra:
+  run:
+    dir: ${results_dir}/${task.name}/${now:%Y-%m-%d_%H-%M-%S}
+  sweep:
+    dir: ${results_dir}/multirun/${now:%Y-%m-%d_%H-%M-%S}
+    subdir: ${hydra.job.num}
+  job:
+    chdir: false  # Don't change working directory
+  output_subdir: .hydra

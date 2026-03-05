@@ -1,0 +1,40 @@
+# V1 Network Configuration
+# Defines neural network architecture parameters
+
+# Number of neurons in the network
+neurons: 51978
+
+# Number of input units (LGN)
+n_input: 17400
+
+# Use only core neurons (exclude shell)
+core_only: false
+
+# Maximum synaptic delay in timesteps
+max_delay: 5
+
+# Scaling factor for input weights
+input_weight_scale: 1.0
+
+# Scaling factor for recurrent weights
+recurrent_weight_scale: 1.0
+
+# Simulation timestep (ms)
+dt: 1.0
+
+# Width of Gaussian surrogate gradient
+gauss_std: 0.28
+
+# Dampening factor for surrogate gradient amplitude
+dampening_factor: 0.5
+
+# Enforce Dale's law (separate E/I populations)
+use_dale_law: true
+
+# Add decoded noise to network
+use_decoded_noise: true
+
+# Noise scale (input_noise, recurrent_noise)
+noise_scale:
+  - 2.0
+  - 2.0

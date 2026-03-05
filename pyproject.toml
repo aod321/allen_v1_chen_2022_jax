@@ -22,6 +22,8 @@ dependencies = [
     "tqdm>=4.65.0",
     "tensorflow>=2.20.0",
     "bmtk>=1.1.4",
+    "hydra-core>=1.3.0",
+    "omegaconf>=2.3.0",
 ]
 
 [project.optional-dependencies]

@@ -1,0 +1,11 @@
+# Garrett Task Configuration
+# Drifting grating discrimination task
+
+# Task identifier
+name: garrett
+
+# Number of output classes
+n_classes: 2
+
+# Task description
+description: "Drifting grating direction discrimination (left vs right)"

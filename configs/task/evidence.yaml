@@ -1,0 +1,11 @@
+# Evidence Accumulation Task Configuration
+# Evidence integration over time
+
+# Task identifier
+name: evidence
+
+# Number of output classes
+n_classes: 2
+
+# Task description
+description: "Evidence accumulation task for decision making"

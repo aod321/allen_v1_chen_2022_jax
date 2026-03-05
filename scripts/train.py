@@ -1,16 +1,31 @@
 #!/usr/bin/env python3
 """Training script for V1 cortical network model.
 
-Usage:
-    python scripts/train.py --config config.json
-    python scripts/train.py --data_dir /path/to/data --results_dir /path/to/results
+This script uses Hydra for configuration management, supporting hierarchical
+configs, command-line overrides, and experiment tracking.
 
-Reference: Chen et al., Science Advances 2022
+Usage:
+    # Default configuration
+    python scripts/train.py
+
+    # Override parameters
+    python scripts/train.py training.learning_rate=1e-4 training.batch_size=4
+
+    # Switch task
+    python scripts/train.py task=evidence
+
+    # Enable wandb logging
+    python scripts/train.py wandb.project=my-project wandb.entity=my-team
+
+    # Use custom config file
+    python scripts/train.py --config-path=/path/to/configs --config-name=custom
+
+Reference:
+    Chen et al., Science Advances 2022
 """
 
 from __future__ import annotations
 
-import argparse
 import datetime
 import json
 import os
@@ -19,7 +34,14 @@ import sys
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Iterator, Optional, Tuple
+from types import ModuleType
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, TYPE_CHECKING
+
+import hydra
+from omegaconf import DictConfig, OmegaConf
+
+if TYPE_CHECKING:
+    import wandb as wandb_module
 
 import jax
 import jax.numpy as jnp
@@ -32,7 +54,10 @@ sys.path.insert(0, str(Path(__file__).parent.parent / 'src'))
 from v1_jax.models import V1Network, V1NetworkConfig, V1NetworkState
 from v1_jax.models.readout import MultiClassReadout, BinaryReadout
 from v1_jax.data.network_loader import load_billeh, cached_load_billeh
-from v1_jax.data.stim_generator import create_drifting_grating_batch, create_classification_labels
+from v1_jax.data.stim_generator import (
+    create_drifting_grating_batch,
+    create_classification_labels,
+)
 from v1_jax.training.trainer import (
     V1Trainer,
     TrainConfig,
@@ -62,15 +87,55 @@ from v1_jax.utils.checkpoint import (
 class ExperimentConfig:
     """Complete experiment configuration.
 
-    Combines all sub-configurations for training.
+    This dataclass provides type-safe access to experiment parameters.
+    It can be created from Hydra's DictConfig or loaded from JSON files.
+
+    Attributes:
+        data_dir: Path to the Billeh network data directory.
+        results_dir: Path to save training results and checkpoints.
+        restore_from: Path to checkpoint for resuming training.
+        task_name: Name of the training task.
+        neurons: Number of neurons in the network.
+        n_input: Number of LGN input units.
+        core_only: Whether to use only core neurons.
+        max_delay: Maximum synaptic delay in timesteps.
+        input_weight_scale: Scaling factor for input weights.
+        n_epochs: Number of training epochs.
+        batch_size: Batch size per device.
+        seq_len: Sequence length (timesteps).
+        steps_per_epoch: Number of training steps per epoch.
+        val_steps: Number of validation steps.
+        learning_rate: Learning rate for optimizer.
+        rate_cost: Spike rate regularization coefficient.
+        voltage_cost: Voltage regularization coefficient.
+        weight_cost: Weight regularization coefficient.
+        gradient_clip_norm: Maximum gradient norm for clipping.
+        dampening_factor: Surrogate gradient dampening factor.
+        gauss_std: Width of Gaussian surrogate gradient.
+        use_dale_law: Whether to enforce Dale's law.
+        use_decoded_noise: Whether to add decoded noise.
+        noise_scale: Noise scale tuple (input, recurrent).
+        num_devices: Number of devices to use (None = all).
+        use_pmap: Whether to use pmap for distributed training.
+        save_interval: Save checkpoint every N epochs.
+        max_checkpoints: Maximum number of checkpoints to keep.
+        seed: Random seed for reproducibility.
+        max_time: Maximum training time in hours (-1 = unlimited).
+        wandb_project: Wandb project name (empty = disabled).
+        wandb_entity: Wandb team/entity name.
+        wandb_name: Wandb run name.
+        wandb_group: Wandb experiment group.
+        wandb_tags: Wandb tags for the run.
+        wandb_notes: Wandb run notes.
     """
+
     # Paths
     data_dir: str = ''
-    results_dir: str = ''
+    results_dir: str = './results'
     restore_from: str = ''
 
     # Task
-    task_name: str = 'garrett'  # garrett, evidence, vcd_grating, ori_diff, 10class
+    task_name: str = 'garrett'
 
     # Network
     neurons: int = 51978
@@ -105,31 +170,144 @@ class ExperimentConfig:
     use_pmap: bool = False
 
     # Checkpointing
-    save_interval: int = 1  # Save every N epochs
+    save_interval: int = 1
     max_checkpoints: int = 10
 
     # Misc
     seed: int = 42
-    max_time: float = -1  # Max training hours (-1 for unlimited)
+    max_time: float = -1
+
+    # Wandb (lazy loading)
+    wandb_project: str = ''
+    wandb_entity: str = ''
+    wandb_name: str = ''
+    wandb_group: str = ''
+    wandb_tags: Tuple[str, ...] = ()
+    wandb_notes: str = ''
 
     def to_dict(self) -> Dict[str, Any]:
-        """Convert to dictionary."""
+        """Convert configuration to dictionary.
+
+        Returns:
+            Dictionary representation of the configuration.
+        """
         return asdict(self)
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> 'ExperimentConfig':
-        """Create from dictionary."""
+        """Create configuration from dictionary.
+
+        Args:
+            d: Dictionary containing configuration parameters.
+
+        Returns:
+            ExperimentConfig instance.
+        """
+        # Handle noise_scale conversion from list to tuple
+        if 'noise_scale' in d and isinstance(d['noise_scale'], list):
+            d = d.copy()
+            d['noise_scale'] = tuple(d['noise_scale'])
+        # Handle wandb_tags conversion from list to tuple
+        if 'wandb_tags' in d and isinstance(d['wandb_tags'], list):
+            d = d.copy()
+            d['wandb_tags'] = tuple(d['wandb_tags'])
         return cls(**d)
 
     @classmethod
     def from_json(cls, path: str) -> 'ExperimentConfig':
-        """Load from JSON file."""
+        """Load configuration from JSON file.
+
+        Args:
+            path: Path to JSON configuration file.
+
+        Returns:
+            ExperimentConfig instance.
+        """
         with open(path, 'r') as f:
             return cls.from_dict(json.load(f))
 
-    def save_json(self, path: str):
-        """Save to JSON file."""
-        with open(path, 'w') as f:
+    @classmethod
+    def from_hydra(cls, cfg: DictConfig) -> 'ExperimentConfig':
+        """Create configuration from Hydra DictConfig.
+
+        Args:
+            cfg: Hydra DictConfig containing nested configuration.
+
+        Returns:
+            ExperimentConfig instance with flattened parameters.
+        """
+        # Flatten nested Hydra config into ExperimentConfig fields
+        config_dict: Dict[str, Any] = {}
+
+        # Top-level fields
+        config_dict['data_dir'] = cfg.get('data_dir', '')
+        config_dict['results_dir'] = cfg.get('results_dir', './results')
+        config_dict['restore_from'] = cfg.get('restore_from', '')
+        config_dict['seed'] = cfg.get('seed', 42)
+        config_dict['max_time'] = cfg.get('max_time', -1)
+        config_dict['num_devices'] = cfg.get('num_devices', None)
+        config_dict['use_pmap'] = cfg.get('use_pmap', False)
+        config_dict['save_interval'] = cfg.get('save_interval', 1)
+        config_dict['max_checkpoints'] = cfg.get('max_checkpoints', 10)
+
+        # Task config
+        if 'task' in cfg:
+            config_dict['task_name'] = cfg.task.get('name', 'garrett')
+
+        # Network config
+        if 'network' in cfg:
+            net = cfg.network
+            config_dict['neurons'] = net.get('neurons', 51978)
+            config_dict['n_input'] = net.get('n_input', 17400)
+            config_dict['core_only'] = net.get('core_only', False)
+            config_dict['max_delay'] = net.get('max_delay', 5)
+            config_dict['input_weight_scale'] = net.get('input_weight_scale', 1.0)
+            config_dict['dampening_factor'] = net.get('dampening_factor', 0.5)
+            config_dict['gauss_std'] = net.get('gauss_std', 0.28)
+            config_dict['use_dale_law'] = net.get('use_dale_law', True)
+            config_dict['use_decoded_noise'] = net.get('use_decoded_noise', True)
+            noise_scale = net.get('noise_scale', [2.0, 2.0])
+            if isinstance(noise_scale, (list, tuple)):
+                config_dict['noise_scale'] = tuple(noise_scale)
+            else:
+                config_dict['noise_scale'] = (2.0, 2.0)
+
+        # Training config
+        if 'training' in cfg:
+            train = cfg.training
+            config_dict['n_epochs'] = train.get('n_epochs', 100)
+            config_dict['batch_size'] = train.get('batch_size', 2)
+            config_dict['seq_len'] = train.get('seq_len', 600)
+            config_dict['steps_per_epoch'] = train.get('steps_per_epoch', 100)
+            config_dict['val_steps'] = train.get('val_steps', 20)
+            config_dict['learning_rate'] = train.get('learning_rate', 1e-3)
+            config_dict['rate_cost'] = train.get('rate_cost', 0.1)
+            config_dict['voltage_cost'] = train.get('voltage_cost', 1e-5)
+            config_dict['weight_cost'] = train.get('weight_cost', 0.0)
+            config_dict['gradient_clip_norm'] = train.get('gradient_clip_norm', 1.0)
+
+        # Wandb config
+        if 'wandb' in cfg:
+            wb = cfg.wandb
+            config_dict['wandb_project'] = wb.get('project', '')
+            config_dict['wandb_entity'] = wb.get('entity', '')
+            config_dict['wandb_name'] = wb.get('name', '')
+            config_dict['wandb_group'] = wb.get('group', '')
+            tags = wb.get('tags', [])
+            config_dict['wandb_tags'] = tuple(tags) if tags else ()
+            config_dict['wandb_notes'] = wb.get('notes', '')
+
+        return cls(**config_dict)
+
+    def save_json(self, path: str) -> None:
+        """Save configuration to JSON file.
+
+        Args:
+            path: Path to save the configuration.
+        """
+        # Convert path to string if it's a Path object
+        path_str = str(path)
+        with open(path_str, 'w') as f:
             json.dump(self.to_dict(), f, indent=2)
 
 
@@ -137,16 +315,23 @@ class ExperimentConfig:
 # Data Loading
 # =============================================================================
 
-def load_target_firing_rates(data_dir: str, n_neurons: int, seed: int) -> Array:
-    """Load and interpolate target firing rates.
+def load_target_firing_rates(
+    data_dir: str,
+    n_neurons: int,
+    seed: int,
+) -> Array:
+    """Load and interpolate target firing rates from experimental data.
+
+    Loads firing rates from the Garrett et al. dataset and interpolates
+    them to match the number of neurons in the network.
 
     Args:
-        data_dir: Data directory path
-        n_neurons: Number of neurons
-        seed: Random seed
+        data_dir: Path to data directory containing firing rates file.
+        n_neurons: Number of neurons to generate target rates for.
+        seed: Random seed for reproducible interpolation.
 
     Returns:
-        Target firing rates array (n_neurons,)
+        Target firing rates array with shape (n_neurons,).
     """
     rates_path = os.path.join(data_dir, 'garrett_firing_rates.pkl')
 
@@ -155,7 +340,8 @@ def load_target_firing_rates(data_dir: str, n_neurons: int, seed: int) -> Array:
             firing_rates = pickle.load(f)
 
         sorted_rates = np.sort(firing_rates)
-        percentiles = (np.arange(len(firing_rates)) + 1).astype(np.float32) / len(firing_rates)
+        percentiles = (np.arange(len(firing_rates)) + 1).astype(np.float32)
+        percentiles /= len(firing_rates)
 
         rng = np.random.RandomState(seed=seed)
         x_rand = rng.uniform(size=n_neurons)
@@ -163,7 +349,6 @@ def load_target_firing_rates(data_dir: str, n_neurons: int, seed: int) -> Array:
 
         return jnp.array(target_rates, dtype=jnp.float32)
     else:
-        # Default target rate if file not found
         print(f"Warning: {rates_path} not found, using default target rates")
         return jnp.full(n_neurons, 0.02, dtype=jnp.float32)
 
@@ -173,15 +358,21 @@ def create_data_iterator(
     is_training: bool = True,
     key: Optional[Array] = None,
 ) -> Iterator[Tuple[Array, Array, Array]]:
-    """Create data iterator for training/validation.
+    """Create a data iterator for training or validation.
+
+    Generates batches of stimuli, labels, and sample weights based on
+    the specified task configuration.
 
     Args:
-        config: Experiment configuration
-        is_training: Whether this is for training
-        key: Random key
+        config: Experiment configuration containing task and data params.
+        is_training: If True, creates training iterator; else validation.
+        key: JAX random key for data generation.
 
     Yields:
-        Tuples of (inputs, labels, weights)
+        Tuple of (inputs, labels, weights) where:
+            - inputs: Stimulus tensor of shape (seq_len, batch_size, n_input)
+            - labels: Label tensor of shape (batch_size,)
+            - weights: Sample weight tensor of shape (batch_size,)
     """
     if key is None:
         key = jax.random.PRNGKey(config.seed)
@@ -193,7 +384,6 @@ def create_data_iterator(
 
         # Generate batch based on task
         if config.task_name == 'garrett':
-            # Drifting grating discrimination
             inputs, labels = create_drifting_grating_batch(
                 batch_size=config.batch_size,
                 seq_len=config.seq_len,
@@ -209,9 +399,7 @@ def create_data_iterator(
                 subkey, (config.batch_size,), 0, 2
             )
 
-        # Default weights (all 1s)
         weights = jnp.ones(config.batch_size, dtype=jnp.float32)
-
         yield inputs, labels, weights
 
 
@@ -220,71 +408,76 @@ def create_data_iterator(
 # =============================================================================
 
 def train_epoch(
-    train_step_fn,
+    train_step_fn: Callable,
     state: TrainState,
     network: V1Network,
-    data_iter: Iterator,
+    data_iter: Iterator[Tuple[Array, Array, Array]],
     metrics_acc: MetricsAccumulator,
     config: ExperimentConfig,
 ) -> TrainState:
     """Run one training epoch.
 
+    Executes training steps over all batches in the data iterator,
+    accumulating metrics and printing progress.
+
     Args:
-        train_step_fn: JIT-compiled training step function
-        state: Current training state
-        network: V1Network instance
-        data_iter: Data iterator
-        metrics_acc: Metrics accumulator
-        config: Experiment configuration
+        train_step_fn: JIT-compiled training step function.
+        state: Current training state containing model parameters.
+        network: V1Network instance for state initialization.
+        data_iter: Iterator yielding (inputs, labels, weights) tuples.
+        metrics_acc: Accumulator for tracking training metrics.
+        config: Experiment configuration.
 
     Returns:
-        Updated TrainState
+        Updated TrainState after processing all batches.
     """
     metrics_acc.reset()
 
     for step, (inputs, labels, weights) in enumerate(data_iter):
-        # Initialize network state for this batch
         batch_size = inputs.shape[1]
         network_state = network.init_state(batch_size)
 
-        # Run training step
         state, output, metrics = train_step_fn(
             state, inputs, labels, weights, network_state
         )
 
-        # Update metrics
         metrics_acc.update(metrics)
 
-        # Print progress
         if (step + 1) % 10 == 0 or step == 0:
             time_str = datetime.datetime.now().strftime('%H:%M:%S')
-            print(f'  [{time_str}] Step {step + 1}/{config.steps_per_epoch}: '
-                  f'{metrics_acc.format_string()}', end='\r')
+            print(
+                f'  [{time_str}] Step {step + 1}/{config.steps_per_epoch}: '
+                f'{metrics_acc.format_string()}',
+                end='\r'
+            )
 
-    print()  # New line after progress
+    print()
     return state
 
 
 def validate(
-    eval_step_fn,
+    eval_step_fn: Callable,
     state: TrainState,
     network: V1Network,
-    data_iter: Iterator,
+    data_iter: Iterator[Tuple[Array, Array, Array]],
     metrics_acc: MetricsAccumulator,
     config: ExperimentConfig,
 ) -> Dict[str, float]:
-    """Run validation.
+    """Run validation on the held-out data.
+
+    Evaluates the model on validation data without gradient computation,
+    accumulating metrics across all batches.
 
     Args:
-        eval_step_fn: JIT-compiled eval step function
-        state: Current training state
-        network: V1Network instance
-        data_iter: Validation data iterator
-        metrics_acc: Metrics accumulator
-        config: Experiment configuration
+        eval_step_fn: JIT-compiled evaluation step function.
+        state: Current training state containing model parameters.
+        network: V1Network instance for state initialization.
+        data_iter: Iterator yielding validation (inputs, labels, weights).
+        metrics_acc: Accumulator for tracking validation metrics.
+        config: Experiment configuration.
 
     Returns:
-        Validation metrics dictionary
+        Dictionary mapping metric names to their average values.
     """
     metrics_acc.reset()
 
@@ -302,24 +495,76 @@ def validate(
 
 
 # =============================================================================
+# Wandb Integration
+# =============================================================================
+
+def init_wandb(config: ExperimentConfig) -> Optional[ModuleType]:
+    """Initialize Weights & Biases logging (lazy loading).
+
+    Wandb is only imported and initialized when wandb_project is specified
+    in the configuration. This avoids unnecessary dependencies.
+
+    Args:
+        config: Experiment configuration containing wandb settings.
+
+    Returns:
+        The wandb module if successfully initialized, None otherwise.
+    """
+    if not config.wandb_project:
+        return None
+
+    try:
+        import wandb as _wandb
+        _wandb.init(
+            project=config.wandb_project,
+            entity=config.wandb_entity or None,
+            name=config.wandb_name or None,
+            group=config.wandb_group or None,
+            tags=list(config.wandb_tags) if config.wandb_tags else None,
+            notes=config.wandb_notes or None,
+            config=config.to_dict(),
+        )
+        print(f"Wandb initialized: {_wandb.run.name}")
+        return _wandb
+    except ImportError:
+        print(
+            "Warning: wandb_project specified but wandb is not installed. "
+            "Install with: pip install wandb"
+        )
+        return None
+
+
+# =============================================================================
 # Main Training Function
 # =============================================================================
 
-def main(config: ExperimentConfig):
-    """Main training function.
+def run_training(config: ExperimentConfig) -> None:
+    """Execute the main training loop.
+
+    This function orchestrates the complete training process including:
+    - Network initialization
+    - Trainer setup
+    - Checkpoint management
+    - Training/validation loops
+    - Metrics logging
 
     Args:
-        config: Experiment configuration
+        config: Complete experiment configuration.
     """
+    # Initialize wandb (lazy loading)
+    wandb = init_wandb(config)
+
     # Print configuration
     print("=" * 60)
-    print("V1 Model Training (JAX)")
+    print("V1 Model Training (JAX + Hydra)")
     print("=" * 60)
     print(f"Task: {config.task_name}")
     print(f"Neurons: {config.neurons}")
     print(f"Devices: {get_device_count()}")
     print(f"Batch size: {config.batch_size}")
     print(f"Sequence length: {config.seq_len}")
+    if wandb:
+        print(f"Wandb: {config.wandb_project}/{wandb.run.name}")
     print("=" * 60)
 
     # Create results directory
@@ -364,7 +609,7 @@ def main(config: ExperimentConfig):
         pool_method='mean',
     )
 
-    def readout_fn(spikes):
+    def readout_fn(spikes: Array) -> Array:
         return readout(spikes)
 
     # Load target firing rates
@@ -400,7 +645,6 @@ def main(config: ExperimentConfig):
         dist_trainer = create_distributed_trainer(trainer, dist_config)
         train_state = dist_trainer.init_state(train_key)
         train_step_fn = dist_trainer.create_train_step_fn(readout_fn)
-        # For eval, create eval step if available
         if hasattr(dist_trainer, 'create_eval_step_fn'):
             eval_step_fn = dist_trainer.create_eval_step_fn(readout_fn)
         else:
@@ -442,8 +686,12 @@ def main(config: ExperimentConfig):
 
         # Create data iterators
         key, train_data_key, val_data_key = jax.random.split(key, 3)
-        train_iter = create_data_iterator(config, is_training=True, key=train_data_key)
-        val_iter = create_data_iterator(config, is_training=False, key=val_data_key)
+        train_iter = create_data_iterator(
+            config, is_training=True, key=train_data_key
+        )
+        val_iter = create_data_iterator(
+            config, is_training=False, key=val_data_key
+        )
 
         # Training
         train_state = train_epoch(
@@ -460,6 +708,12 @@ def main(config: ExperimentConfig):
         # Print validation results
         time_str = datetime.datetime.now().strftime('%H:%M:%S')
         print(f'  [{time_str}] Validation: {val_metrics.format_string()}')
+
+        # Log to wandb
+        if wandb:
+            train_log = {f'train/{k}': v for k, v in train_metrics.compute().items()}
+            val_log = {f'val/{k}': v for k, v in val_results.items()}
+            wandb.log({**train_log, **val_log, 'epoch': epoch + 1})
 
         # Save checkpoint
         if (epoch + 1) % config.save_interval == 0:
@@ -502,107 +756,40 @@ def main(config: ExperimentConfig):
     print(f'\nTraining complete! Results saved to {results_path}')
     ckpt_manager.close()
 
+    # Finish wandb run
+    if wandb:
+        wandb.finish()
+
 
 # =============================================================================
-# CLI
+# Hydra Entry Point
 # =============================================================================
 
-def parse_args():
-    """Parse command line arguments."""
-    parser = argparse.ArgumentParser(description='Train V1 cortical network model')
+@hydra.main(
+    version_base=None,
+    config_path="../configs",
+    config_name="config",
+)
+def main(cfg: DictConfig) -> None:
+    """Hydra main entry point.
 
-    # Config file
-    parser.add_argument('--config', type=str, default='',
-                        help='Path to config JSON file')
+    This function is decorated with @hydra.main and serves as the
+    entry point for Hydra-based configuration management.
 
-    # Paths
-    parser.add_argument('--data_dir', type=str, default='',
-                        help='Data directory')
-    parser.add_argument('--results_dir', type=str, default='./results',
-                        help='Results directory')
-    parser.add_argument('--restore_from', type=str, default='',
-                        help='Checkpoint to restore from')
+    Args:
+        cfg: Hydra DictConfig containing the merged configuration
+            from YAML files and command-line overrides.
+    """
+    # Print resolved config for debugging
+    print("\nResolved configuration:")
+    print(OmegaConf.to_yaml(cfg))
 
-    # Task
-    parser.add_argument('--task_name', type=str, default='garrett',
-                        choices=['garrett', 'evidence', 'vcd_grating', 'ori_diff', '10class'],
-                        help='Task to train')
+    # Convert Hydra config to ExperimentConfig
+    config = ExperimentConfig.from_hydra(cfg)
 
-    # Network
-    parser.add_argument('--neurons', type=int, default=51978,
-                        help='Number of neurons')
-    parser.add_argument('--max_delay', type=int, default=5,
-                        help='Maximum synaptic delay')
-
-    # Training
-    parser.add_argument('--n_epochs', type=int, default=100,
-                        help='Number of epochs')
-    parser.add_argument('--batch_size', type=int, default=2,
-                        help='Batch size')
-    parser.add_argument('--seq_len', type=int, default=600,
-                        help='Sequence length')
-    parser.add_argument('--steps_per_epoch', type=int, default=100,
-                        help='Steps per epoch')
-
-    # Optimizer
-    parser.add_argument('--learning_rate', type=float, default=1e-3,
-                        help='Learning rate')
-    parser.add_argument('--rate_cost', type=float, default=0.1,
-                        help='Spike rate regularization')
-    parser.add_argument('--voltage_cost', type=float, default=1e-5,
-                        help='Voltage regularization')
-
-    # Distributed
-    parser.add_argument('--num_devices', type=int, default=None,
-                        help='Number of devices to use')
-    parser.add_argument('--use_pmap', action='store_true',
-                        help='Use pmap instead of sharding')
-
-    # Misc
-    parser.add_argument('--seed', type=int, default=42,
-                        help='Random seed')
-    parser.add_argument('--max_time', type=float, default=-1,
-                        help='Max training time in hours')
-
-    return parser.parse_args()
-
-
-def main_cli():
-    """Main CLI entry point."""
-    args = parse_args()
-
-    # Load config from file or create from args
-    if args.config:
-        config = ExperimentConfig.from_json(args.config)
-        # Override with command line args
-        for key, value in vars(args).items():
-            if key != 'config' and value is not None:
-                if hasattr(config, key):
-                    # Only override if explicitly set (not default)
-                    setattr(config, key, value)
-    else:
-        config = ExperimentConfig(
-            data_dir=args.data_dir,
-            results_dir=args.results_dir,
-            restore_from=args.restore_from,
-            task_name=args.task_name,
-            neurons=args.neurons,
-            max_delay=args.max_delay,
-            n_epochs=args.n_epochs,
-            batch_size=args.batch_size,
-            seq_len=args.seq_len,
-            steps_per_epoch=args.steps_per_epoch,
-            learning_rate=args.learning_rate,
-            rate_cost=args.rate_cost,
-            voltage_cost=args.voltage_cost,
-            num_devices=args.num_devices,
-            use_pmap=args.use_pmap,
-            seed=args.seed,
-            max_time=args.max_time,
-        )
-
-    main(config)
+    # Run training
+    run_training(config)
 
 
 if __name__ == '__main__':
-    main_cli()
+    main()
