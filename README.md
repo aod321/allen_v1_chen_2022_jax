@@ -81,6 +81,61 @@ uv sync
 
 ---
 
+## Data Setup
+
+### Required Data Files
+
+This project requires the Billeh V1 network data from Allen Institute. Download from:
+
+**Download Link**: [TU Graz Cloud](https://cloud.tugraz.at/index.php/s/JmDakasAHEqsA9J)
+
+### File Structure
+
+After downloading and extracting, your data directory should look like:
+
+```
+/path/to/data/
+├── GLIF_network/
+│   ├── network/
+│   │   ├── v1_node_types.csv      # Neuron type definitions
+│   │   └── v1_nodes.h5            # Neuron properties
+│   ├── input_dat.pkl              # Input connectivity
+│   └── network_dat.pkl            # Recurrent connectivity
+├── lgn_full_col_cells_3.csv       # LGN neuron parameters
+├── temporal_kernels.pkl           # LGN temporal filters (cached)
+├── alternate_small_stimuli.pkl    # Dataset: alternating stimuli
+├── many_small_stimuli.pkl         # Dataset: classification images
+└── EA_LGN.h5                      # Dataset: evidence accumulation
+```
+
+### Quick Verification
+
+```bash
+# Check data integrity
+uv run python -c "
+from v1_jax.data import load_billeh
+input_pop, network, bkg = load_billeh(data_dir='/path/to/GLIF_network')
+print(f'Neurons: {network[\"n_nodes\"]:,}')
+print(f'Synapses: {network[\"n_edges\"]:,}')
+"
+```
+
+### Data Path Configuration
+
+Set the data path when running training:
+
+```bash
+uv run python scripts/train.py data_dir=/path/to/GLIF_network
+```
+
+Or in Python:
+
+```python
+network = V1Network.from_billeh(network_path='/path/to/GLIF_network')
+```
+
+---
+
 ## Quick Start
 
 ### Basic Usage
