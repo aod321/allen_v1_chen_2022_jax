@@ -24,11 +24,14 @@ from ..nn.glif3_cell import (
     GLIF3Params,
     glif3_step,
     glif3_unroll,
+    glif3_unroll_checkpointed,
 )
 from ..nn.sparse_layer import (
     InputLayer,
     RecurrentLayer,
     SparseConnectivity,
+    SparseFormat,
+    BCSRStructure,
     prepare_input_connectivity,
     prepare_recurrent_connectivity,
 )
@@ -50,6 +53,13 @@ class V1NetworkConfig:
         use_dale_law: Whether to enforce Dale's law
         use_decoded_noise: Whether to use decoded background noise
         noise_scale: (quick_noise_scale, slow_noise_scale)
+        use_gradient_checkpointing: Whether to use gradient checkpointing
+            to reduce memory at the cost of recomputation
+        checkpoint_every_n_steps: Number of timesteps per checkpoint segment.
+            Only used when use_gradient_checkpointing=True.
+            Smaller values save more memory but increase recomputation.
+        sparse_format: Sparse matrix format ("bcsr" or "bcoo").
+            BCSR provides ~1.8x faster matmul via cuSPARSE.
     """
     dt: float = 1.0
     gauss_std: float = 0.5
@@ -60,6 +70,9 @@ class V1NetworkConfig:
     use_dale_law: bool = True
     use_decoded_noise: bool = False
     noise_scale: Tuple[float, float] = (1.0, 1.0)
+    use_gradient_checkpointing: bool = False
+    checkpoint_every_n_steps: int = 50
+    sparse_format: SparseFormat = "bcsr"
 
 
 class V1NetworkState(NamedTuple):
@@ -143,15 +156,19 @@ class V1Network:
         config: Optional[V1NetworkConfig] = None,
         bkg_weights: Optional[np.ndarray] = None,
         noise_data: Optional[np.ndarray] = None,
+        network_data: Optional[Dict[str, Any]] = None,
+        input_pop: Optional[Dict[str, Any]] = None,
     ) -> 'V1Network':
         """Create V1 network from Billeh network data files.
 
         Args:
-            network_path: Path to network data directory
+            network_path: Path to network data directory (used if network_data/input_pop not provided)
             lgn_model: Optional LGN model
             config: Network configuration
             bkg_weights: Background weights (n_neurons * n_receptors,)
             noise_data: Pre-loaded noise data for decoded noise mode
+            network_data: Pre-loaded network data dict (optional, avoids reloading)
+            input_pop: Pre-loaded input population dict (optional)
 
         Returns:
             Initialized V1Network
@@ -159,8 +176,17 @@ class V1Network:
         if config is None:
             config = V1NetworkConfig()
 
-        # Load network data
-        network, input_pop = load_billeh(network_path)
+        # Use pre-loaded data if provided, otherwise load from path
+        if network_data is not None and input_pop is not None:
+            network = network_data
+        else:
+            # Load network data from path
+            input_pop, network, bkg_weights = load_billeh(
+                n_input=17400,  # Default value
+                n_neurons=51978,  # Default: all neurons
+                core_only=False,
+                data_dir=network_path,
+            )
 
         # Create GLIF3 parameters
         glif3_params, metadata = GLIF3Cell.from_network(
@@ -193,10 +219,14 @@ class V1Network:
         # Default background weights if not provided
         if bkg_weights is None:
             bkg_weights = np.ones(n_neurons * n_receptors, dtype=np.float32)
-            # Scale by voltage
-            bkg_weights = bkg_weights / np.repeat(
-                voltage_scale_types[node_type_ids], n_receptors
-            )
+        # Scale by voltage (matching TF: divide by voltage_scale, then multiply by 10)
+        # TF: bkg_weights = bkg_weights / np.repeat(voltage_scale[self._node_type_ids], self._n_receptors)
+        bkg_weights = bkg_weights / np.repeat(
+            voltage_scale_types[node_type_ids], n_receptors
+        )
+        # Multiply by 10 to match TF implementation
+        # TF: self.bkg_weights = tf.Variable(bkg_weights * 10., ...)
+        bkg_weights = bkg_weights * 10.0
 
         input_layer = InputLayer(
             indices=input_indices,
@@ -206,6 +236,7 @@ class V1Network:
             use_decoded_noise=config.use_decoded_noise,
             noise_data=noise_data,
             noise_scale=config.noise_scale,
+            sparse_format=config.sparse_format,
         )
 
         # Prepare recurrent connectivity
@@ -228,6 +259,7 @@ class V1Network:
             n_neurons=n_neurons,
             n_receptors=n_receptors,
             max_delay=config.max_delay,
+            sparse_format=config.sparse_format,
         )
 
         return cls(
@@ -310,19 +342,34 @@ class V1Network:
         def recurrent_fn(z_buf):
             return self.recurrent_layer(z_buf)
 
-        # Run GLIF3 unroll
-        final_glif3_state, all_spikes, all_voltages = glif3_unroll(
-            params=self.glif3_params,
-            initial_state=state.glif3_state,
-            inputs=input_current,
-            recurrent_fn=recurrent_fn,
-            n_neurons=self.n_neurons,
-            n_receptors=self.n_receptors,
-            max_delay=self.max_delay,
-            dt=self.config.dt,
-            gauss_std=self.config.gauss_std,
-            dampening_factor=self.config.dampening_factor,
-        )
+        # Run GLIF3 unroll (with or without gradient checkpointing)
+        if self.config.use_gradient_checkpointing:
+            final_glif3_state, all_spikes, all_voltages = glif3_unroll_checkpointed(
+                params=self.glif3_params,
+                initial_state=state.glif3_state,
+                inputs=input_current,
+                recurrent_fn=recurrent_fn,
+                n_neurons=self.n_neurons,
+                n_receptors=self.n_receptors,
+                max_delay=self.max_delay,
+                dt=self.config.dt,
+                gauss_std=self.config.gauss_std,
+                dampening_factor=self.config.dampening_factor,
+                checkpoint_every_n_steps=self.config.checkpoint_every_n_steps,
+            )
+        else:
+            final_glif3_state, all_spikes, all_voltages = glif3_unroll(
+                params=self.glif3_params,
+                initial_state=state.glif3_state,
+                inputs=input_current,
+                recurrent_fn=recurrent_fn,
+                n_neurons=self.n_neurons,
+                n_receptors=self.n_receptors,
+                max_delay=self.max_delay,
+                dt=self.config.dt,
+                gauss_std=self.config.gauss_std,
+                dampening_factor=self.config.dampening_factor,
+            )
 
         final_state = V1NetworkState(
             glif3_state=final_glif3_state,
@@ -390,6 +437,7 @@ class V1Network:
             recurrent_weights = params['recurrent_weights']
 
         # Create new layers with updated weights
+        # Reuse BCSR structures for efficiency (only weights change)
         new_input_layer = InputLayer(
             indices=self.input_layer.connectivity.indices,
             weights=input_weights,
@@ -398,6 +446,8 @@ class V1Network:
             use_decoded_noise=self.input_layer.use_decoded_noise,
             noise_data=self.input_layer.noise_data,
             noise_scale=self.input_layer.noise_scale,
+            sparse_format=self.input_layer.sparse_format,
+            bcsr_structure=getattr(self.input_layer, '_bcsr_structure', None),
         )
 
         new_recurrent_layer = RecurrentLayer(
@@ -407,6 +457,8 @@ class V1Network:
             n_neurons=self.n_neurons,
             n_receptors=self.n_receptors,
             max_delay=self.max_delay,
+            sparse_format=self.recurrent_layer.sparse_format,
+            bcsr_structure=getattr(self.recurrent_layer, '_bcsr_structure', None),
         )
 
         return V1Network(

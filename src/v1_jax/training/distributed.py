@@ -22,9 +22,11 @@ import jax.numpy as jnp
 from jax import Array
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
 import numpy as np
+import optax
 
 from .trainer import TrainState, TrainMetrics, V1Trainer
 from ..models.v1_network import V1NetworkState, V1NetworkOutput
+from .distributed_zero import ZeRO2Trainer, ZeROConfig, ZeROTrainState, create_zero2_trainer
 
 
 # =============================================================================
@@ -40,11 +42,13 @@ class DistributedConfig:
         data_axis_name: Axis name for data parallelism
         use_pmap: Use legacy pmap (False for modern sharding)
         gradient_reduce: How to reduce gradients ('mean' or 'sum')
+        use_zero2: Use ZeRO-2 optimizer state sharding for memory efficiency
     """
     num_devices: Optional[int] = None
     data_axis_name: str = 'batch'
     use_pmap: bool = False
     gradient_reduce: str = 'mean'
+    use_zero2: bool = False
 
 
 # =============================================================================
@@ -152,16 +156,21 @@ class ShardedTrainer:
             jax.device_put(weights, self.sharded_batch),
         )
 
-    def init_state(self, rng_key: Array) -> TrainState:
+    def init_state(
+        self,
+        rng_key: Array,
+        readout_params: Optional[Dict[str, Array]] = None,
+    ) -> TrainState:
         """Initialize replicated training state.
 
         Args:
             rng_key: Random key
+            readout_params: Optional readout layer parameters
 
         Returns:
             Replicated TrainState
         """
-        state = self.trainer.init_train_state(rng_key)
+        state = self.trainer.init_train_state(rng_key, readout_params=readout_params)
 
         # Replicate state across devices
         return TrainState(
@@ -259,11 +268,16 @@ class PmapTrainer:
         """
         return jax.tree.map(lambda x: x[0], pytree)
 
-    def init_state(self, rng_key: Array) -> TrainState:
+    def init_state(
+        self,
+        rng_key: Array,
+        readout_params: Optional[Dict[str, Array]] = None,
+    ) -> TrainState:
         """Initialize replicated training state.
 
         Args:
             rng_key: Random key
+            readout_params: Optional readout layer parameters
 
         Returns:
             Replicated TrainState
@@ -274,7 +288,7 @@ class PmapTrainer:
         # Initialize states for each device
         states = []
         for i, key in enumerate(keys):
-            state = self.trainer.init_train_state(key)
+            state = self.trainer.init_train_state(key, readout_params=readout_params)
             states.append(state)
 
         # Stack states
@@ -292,19 +306,11 @@ class PmapTrainer:
         Returns:
             Pmap-ed train step function
         """
-        def single_device_step(
-            state: TrainState,
-            inputs: Array,
-            labels: Array,
-            sample_weights: Array,
-            network_state: V1NetworkState,
-        ) -> Tuple[TrainState, V1NetworkOutput, TrainMetrics]:
-            return self.trainer.train_step(
-                state, inputs, labels, sample_weights, network_state, readout_fn
-            )
+        trainer = self.trainer
+        axis_name = self.axis_name
 
         # Pmap with gradient synchronization
-        @partial(jax.pmap, axis_name=self.axis_name)
+        @partial(jax.pmap, axis_name=axis_name)
         def pmap_train_step(
             state: TrainState,
             inputs: Array,
@@ -312,19 +318,53 @@ class PmapTrainer:
             sample_weights: Array,
             network_state: V1NetworkState,
         ) -> Tuple[TrainState, V1NetworkOutput, TrainMetrics]:
-            new_state, output, metrics = single_device_step(
-                state, inputs, labels, sample_weights, network_state
+            # Split key for this step
+            rng_key, new_key = jax.random.split(state.rng_key)
+
+            # Compute gradients
+            grad_fn = jax.value_and_grad(trainer._compute_loss, has_aux=True)
+            (loss, (output, metrics)), grads = grad_fn(
+                state.params,
+                state.initial_params,
+                inputs,
+                labels,
+                sample_weights,
+                network_state,
+                readout_fn,
+                rng_key,
+            )
+
+            # Synchronize gradients across devices (key for data parallelism!)
+            grads = jax.lax.pmean(grads, axis_name=axis_name)
+
+            # Apply optimizer updates
+            updates, new_opt_state = trainer.optimizer.update(
+                grads, state.opt_state, state.params
+            )
+            new_params = optax.apply_updates(state.params, updates)
+
+            # Apply Dale's law constraints immediately after parameter update
+            new_params = trainer._apply_dale_constraints(new_params, state.sign_masks)
+
+            # Create new state
+            new_state = TrainState(
+                step=state.step + 1,
+                params=new_params,
+                opt_state=new_opt_state,
+                initial_params=state.initial_params,
+                rng_key=new_key,
+                sign_masks=state.sign_masks,
             )
 
             # Synchronize metrics across devices
             synced_metrics = TrainMetrics(
-                loss=jax.lax.pmean(metrics.loss, axis_name=self.axis_name),
-                classification_loss=jax.lax.pmean(metrics.classification_loss, axis_name=self.axis_name),
-                rate_loss=jax.lax.pmean(metrics.rate_loss, axis_name=self.axis_name),
-                voltage_loss=jax.lax.pmean(metrics.voltage_loss, axis_name=self.axis_name),
-                weight_loss=jax.lax.pmean(metrics.weight_loss, axis_name=self.axis_name),
-                accuracy=jax.lax.pmean(metrics.accuracy, axis_name=self.axis_name),
-                mean_rate=jax.lax.pmean(metrics.mean_rate, axis_name=self.axis_name),
+                loss=jax.lax.pmean(metrics.loss, axis_name=axis_name),
+                classification_loss=jax.lax.pmean(metrics.classification_loss, axis_name=axis_name),
+                rate_loss=jax.lax.pmean(metrics.rate_loss, axis_name=axis_name),
+                voltage_loss=jax.lax.pmean(metrics.voltage_loss, axis_name=axis_name),
+                weight_loss=jax.lax.pmean(metrics.weight_loss, axis_name=axis_name),
+                accuracy=jax.lax.pmean(metrics.accuracy, axis_name=axis_name),
+                mean_rate=jax.lax.pmean(metrics.mean_rate, axis_name=axis_name),
             )
 
             return new_state, output, synced_metrics
@@ -465,7 +505,7 @@ def sync_batch_stats(
 def create_distributed_trainer(
     trainer: V1Trainer,
     config: Optional[DistributedConfig] = None,
-) -> Union[ShardedTrainer, PmapTrainer]:
+) -> Union[ShardedTrainer, PmapTrainer, ZeRO2Trainer]:
     """Create appropriate distributed trainer.
 
     Args:
@@ -473,11 +513,19 @@ def create_distributed_trainer(
         config: Distributed configuration
 
     Returns:
-        ShardedTrainer or PmapTrainer based on config
+        ShardedTrainer, PmapTrainer, or ZeRO2Trainer based on config
     """
     config = config or DistributedConfig()
 
-    if config.use_pmap:
+    if config.use_zero2:
+        # Use ZeRO-2 for memory-efficient training
+        zero_config = ZeROConfig(
+            num_devices=config.num_devices,
+            data_axis_name=config.data_axis_name,
+            gradient_reduce=config.gradient_reduce,
+        )
+        return create_zero2_trainer(trainer, zero_config)
+    elif config.use_pmap:
         return PmapTrainer(trainer, config)
     else:
         return ShardedTrainer(trainer, config)

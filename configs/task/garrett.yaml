@@ -1,11 +1,33 @@
 # Garrett Task Configuration
-# Drifting grating discrimination task
+# Fine orientation discrimination with drifting grating
+# Reference: Chen et al., Science Advances 2022
 
 # Task identifier
 name: garrett
 
-# Number of output classes
+# Number of output classes (binary: greater/less than 45°)
 n_classes: 2
 
 # Task description
-description: "Drifting grating direction discrimination (left vs right)"
+description: "Fine orientation discrimination (drifting grating)"
+
+# L5 Readout configuration (biologically realistic)
+# Uses single L5 pool with threshold judgment: r > r₀ = 0.01
+readout:
+  # Use L5 pyramidal cell readout (true) or linear readout (false)
+  use_l5_readout: false
+
+  # Readout strategy: 'threshold' for binary, 'competition' for multi-class
+  strategy: threshold
+
+  # Pool index for threshold readout (pool 0 for garrett)
+  pool_index: 0
+
+  # Threshold value r₀
+  threshold: 0.01
+
+  # Number of L5 readout populations to load
+  n_readout_populations: 15
+
+  # Number of L5 neurons per pool
+  neurons_per_class: 16

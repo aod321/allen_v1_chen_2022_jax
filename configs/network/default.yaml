@@ -38,3 +38,25 @@ use_decoded_noise: true
 noise_scale:
   - 2.0
   - 2.0
+
+# =============================================================================
+# Sparse Matrix Format (brainevent)
+# =============================================================================
+# This project uses brainevent.CSR for event-driven spike propagation.
+# The CSR format enables efficient sparse matmul that only processes
+# neurons that actually fired (5-20x speedup at ~5% firing rate).
+#
+# NOTE: Gradient checkpointing is NOT needed because we use IODim
+# (online eligibility traces) instead of BPTT. IODim doesn't store
+# intermediate activations, so memory usage is already O(1) per timestep.
+sparse_format: brainevent_csr
+
+# =============================================================================
+# LGN Preprocessing
+# =============================================================================
+# Enable LGN preprocessing for visual stimuli
+use_lgn: false
+
+# LGN movie dimensions (default: 120x240)
+lgn_movie_height: 120
+lgn_movie_width: 240

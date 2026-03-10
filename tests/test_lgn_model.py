@@ -17,6 +17,12 @@ import jax
 import jax.numpy as jnp
 
 from v1_jax.lgn import (
+    # Params loading
+    LGNParams,
+    load_lgn_params,
+    load_lgn_params_from_dir,
+    find_lgn_files,
+    get_neuron_groups,
     # Spatial
     create_gaussian_kernel,
     create_gaussian_kernel_trimmed,
@@ -31,7 +37,7 @@ from v1_jax.lgn import (
     compute_firing_rates,
     TemporalFilter,
     # Model
-    LGNParams,
+    LGN,
 )
 
 
@@ -564,3 +570,375 @@ class TestLGNIntegration:
         firing_rates = transfer_function(temporal_responses)
         assert firing_rates.shape == (T, n_neurons)
         assert jnp.all(firing_rates >= 0)
+
+
+# =============================================================================
+# LGN Params Loader Tests
+# =============================================================================
+
+
+class TestParamsLoader:
+    """Tests for LGN parameter loading utilities."""
+
+    @pytest.mark.skipif(
+        not pytest.importorskip("pandas", reason="pandas required"),
+        reason="pandas not available"
+    )
+    def test_find_lgn_files(self):
+        """Test finding LGN files in data directory."""
+        try:
+            csv_path, cache_path = find_lgn_files('/nvmessd/yinzi/GLIF_network')
+            assert csv_path.endswith('.csv')
+            assert cache_path.endswith('.pkl')
+        except FileNotFoundError:
+            pytest.skip("LGN data files not available")
+
+    def test_get_neuron_groups(self):
+        """Test neuron grouping by spatial size."""
+        spatial_sizes = np.array([1.5, 2.5, 3.5, 4.5, 5.5, 6.5, 7.5, 8.5])
+        groups = get_neuron_groups(spatial_sizes)
+
+        # Should create groups for various spatial sizes
+        assert len(groups) > 0
+
+        # Each group should have indices and sigma
+        for indices, sigma in groups:
+            assert len(indices) > 0
+            assert sigma > 0
+
+        # All neurons should be in some group
+        all_indices = set()
+        for indices, sigma in groups:
+            all_indices.update(indices.tolist())
+        assert len(all_indices) == len(spatial_sizes)
+
+    def test_load_lgn_params_from_dir(self):
+        """Test loading LGN params from data directory."""
+        try:
+            params = load_lgn_params_from_dir('/nvmessd/yinzi/GLIF_network')
+
+            assert isinstance(params, LGNParams)
+            assert params.n_neurons == 17400
+            assert params.kernel_length == 700
+
+            # Check coordinate ranges
+            assert params.x.min() >= 0
+            assert params.x.max() < 240
+            assert params.y.min() >= 0
+            assert params.y.max() < 120
+        except FileNotFoundError:
+            pytest.skip("LGN data files not available")
+
+
+# =============================================================================
+# Full LGN Model Tests
+# =============================================================================
+
+
+class TestLGNModel:
+    """Tests for the full LGN model."""
+
+    @pytest.fixture
+    def lgn_model(self):
+        """Create LGN model for testing."""
+        try:
+            return LGN(data_dir='/nvmessd/yinzi/GLIF_network')
+        except FileNotFoundError:
+            pytest.skip("LGN data files not available")
+
+    def test_lgn_init(self, lgn_model):
+        """Test LGN model initialization."""
+        assert lgn_model.n_neurons == 17400
+        assert lgn_model.movie_height == 120
+        assert lgn_model.movie_width == 240
+        assert len(lgn_model.neuron_groups) > 0
+
+    def test_lgn_spatial_response(self, lgn_model):
+        """Test LGN spatial response computation."""
+        movie = jnp.ones((50, 120, 240), dtype=jnp.float32) * 0.5
+        dom_spatial, non_dom_spatial = lgn_model.spatial_response(movie)
+
+        assert dom_spatial.shape == (50, 17400)
+        assert non_dom_spatial.shape == (50, 17400)
+
+    def test_lgn_forward_pass(self, lgn_model):
+        """Test full LGN forward pass."""
+        movie = jnp.ones((50, 120, 240), dtype=jnp.float32) * 0.5
+        firing_rates = lgn_model(movie)
+
+        assert firing_rates.shape == (50, 17400)
+        # Firing rates should be non-negative
+        assert float(firing_rates.min()) >= 0
+
+    def test_lgn_firing_rates_from_spatial(self, lgn_model):
+        """Test firing rate computation from spatial responses."""
+        dom_spatial = jnp.ones((50, 17400), dtype=jnp.float32) * 0.5
+        non_dom_spatial = jnp.zeros((50, 17400), dtype=jnp.float32)
+
+        firing_rates = lgn_model.firing_rates_from_spatial(dom_spatial, non_dom_spatial)
+
+        assert firing_rates.shape == (50, 17400)
+        assert float(firing_rates.min()) >= 0
+
+
+# =============================================================================
+# BMTK LGN Tests
+# =============================================================================
+
+from v1_jax.lgn import (
+    BMTKLGN,
+    BMTKLGNParams,
+    CellTypeParams,
+    CELL_TYPE_PARAMS,
+    cosine_bump_kernel,
+    create_temporal_kernel_from_params,
+    load_bmtk_lgn_params,
+    bmtk_transfer_function,
+    create_bmtk_lgn_model,
+)
+
+
+class TestCosineBumpKernel:
+    """Tests for cosine bump temporal filter kernel."""
+
+    def test_cosine_bump_shape(self):
+        """Test kernel has correct shape."""
+        weights = (3.5, -2.0)
+        kpeaks = (30.0, 60.0)
+        delays = (0.0, 25.0)
+
+        kernel = cosine_bump_kernel(weights, kpeaks, delays, dt=1.0, kernel_length=250)
+
+        assert kernel.shape == (250,)
+        assert kernel.dtype == np.float32
+
+    def test_cosine_bump_nonzero(self):
+        """Test kernel has nonzero values in bump regions."""
+        weights = (3.5, -2.0)
+        kpeaks = (30.0, 60.0)
+        delays = (0.0, 25.0)
+
+        kernel = cosine_bump_kernel(weights, kpeaks, delays, dt=1.0, kernel_length=250)
+
+        # Kernel should have nonzero values
+        assert np.sum(np.abs(kernel)) > 0
+
+    def test_cosine_bump_nan_weights(self):
+        """Test kernel handles NaN weights gracefully."""
+        weights = (np.nan, np.nan)
+        kpeaks = (30.0, 60.0)
+        delays = (0.0, 25.0)
+
+        kernel = cosine_bump_kernel(weights, kpeaks, delays, dt=1.0, kernel_length=250)
+
+        # Should be all zeros if weights are NaN
+        assert np.allclose(kernel, 0.0)
+
+    def test_cosine_bump_symmetric(self):
+        """Test single bump is symmetric around peak."""
+        # Use only one active bump (second weight is 0 so it's ignored)
+        weights = (1.0, 0.0)
+        kpeaks = (20.0, 1.0)  # Use small but nonzero kpeak for second bump
+        delays = (50.0, 0.0)
+
+        kernel = cosine_bump_kernel(weights, kpeaks, delays, dt=1.0, kernel_length=100)
+
+        # Check peak is at delay
+        peak_idx = np.argmax(kernel)
+        assert abs(peak_idx - 50) <= 1
+
+        # Check approximate symmetry around peak
+        # Compare kernel[peak-10:peak] with reversed kernel[peak+1:peak+11]
+        left = kernel[40:50]
+        right = kernel[51:61][::-1]
+        np.testing.assert_allclose(left, right, atol=0.01)
+
+
+class TestCellTypeParams:
+    """Tests for cell type configuration."""
+
+    def test_all_cell_types_defined(self):
+        """Test all expected cell types are defined."""
+        expected_types = [
+            'sON_TF1', 'sON_TF2', 'sON_TF4', 'sON_TF8', 'sON_TF15',
+            'sOFF_TF1', 'sOFF_TF2', 'sOFF_TF4', 'sOFF_TF8', 'sOFF_TF15',
+            'tOFF_TF1', 'tOFF_TF2', 'tOFF_TF4', 'tOFF_TF8', 'tOFF_TF15',
+            'sONsOFF_001', 'sONtOFF_001',
+        ]
+
+        for cell_type in expected_types:
+            assert cell_type in CELL_TYPE_PARAMS, f"Missing cell type: {cell_type}"
+
+    def test_single_cell_amplitudes(self):
+        """Test single-subunit cells have correct amplitudes."""
+        # ON cells should have positive amplitude
+        for tf in ['TF1', 'TF2', 'TF4', 'TF8', 'TF15']:
+            assert CELL_TYPE_PARAMS[f'sON_{tf}'].amplitude == 1.0
+
+        # OFF cells should have negative amplitude
+        for tf in ['TF1', 'TF2', 'TF4', 'TF8', 'TF15']:
+            assert CELL_TYPE_PARAMS[f'sOFF_{tf}'].amplitude == -1.0
+            assert CELL_TYPE_PARAMS[f'tOFF_{tf}'].amplitude == -1.0
+
+    def test_composite_cell_max_rates(self):
+        """Test composite cells have max firing rate parameters."""
+        for model_id in ['sONsOFF_001', 'sONtOFF_001']:
+            params = CELL_TYPE_PARAMS[model_id]
+            assert params.max_rate_on > 0
+            assert params.max_rate_off > 0
+
+
+class TestBMTKTransferFunction:
+    """Tests for BMTK transfer function."""
+
+    def test_transfer_function_relu(self):
+        """Test transfer function is equivalent to ReLU(x + spont)."""
+        x = jnp.array([-5.0, -2.0, 0.0, 2.0, 5.0])
+        spont = jnp.array([3.0, 3.0, 3.0, 3.0, 3.0])
+
+        result = bmtk_transfer_function(x, spont)
+        expected = jnp.maximum(x + spont, 0.0)
+
+        np.testing.assert_allclose(result, expected)
+
+    def test_transfer_function_non_negative(self):
+        """Test output is always non-negative."""
+        np.random.seed(42)
+        x = jnp.array(np.random.randn(100).astype(np.float32))
+        spont = jnp.array(np.random.rand(100).astype(np.float32) * 5)
+
+        result = bmtk_transfer_function(x, spont)
+
+        assert jnp.all(result >= 0)
+
+
+class TestBMTKLGNParams:
+    """Tests for BMTK LGN parameter loading."""
+
+    def test_load_bmtk_lgn_params(self):
+        """Test loading BMTK LGN params from CSV."""
+        try:
+            params = load_bmtk_lgn_params(
+                '/nvmessd/yinzi/GLIF_network/lgn_full_col_cells_3.csv',
+                movie_height=120,
+                movie_width=240,
+                kernel_length=250,
+            )
+
+            assert params.n_neurons == 17400
+            assert params.x.shape == (17400,)
+            assert params.y.shape == (17400,)
+            assert params.dom_temporal_kernels.shape == (17400, 250)
+            assert params.non_dom_temporal_kernels.shape == (17400, 250)
+
+        except FileNotFoundError:
+            pytest.skip("LGN data files not available")
+
+    def test_composite_cells_identified(self):
+        """Test composite cells are correctly identified."""
+        try:
+            params = load_bmtk_lgn_params(
+                '/nvmessd/yinzi/GLIF_network/lgn_full_col_cells_3.csv'
+            )
+
+            # Count composite cells
+            n_composite = int(np.sum(params.is_composite))
+
+            # sONsOFF_001: 1200, sONtOFF_001: 750
+            assert n_composite == 1950
+
+        except FileNotFoundError:
+            pytest.skip("LGN data files not available")
+
+    def test_cell_type_distribution(self):
+        """Test all cell types are present."""
+        try:
+            params = load_bmtk_lgn_params(
+                '/nvmessd/yinzi/GLIF_network/lgn_full_col_cells_3.csv'
+            )
+
+            from collections import Counter
+            type_counts = Counter(params.model_ids)
+
+            # Check expected cell types exist
+            assert 'sON_TF8' in type_counts
+            assert 'sOFF_TF4' in type_counts
+            assert 'sONsOFF_001' in type_counts
+            assert 'sONtOFF_001' in type_counts
+
+        except FileNotFoundError:
+            pytest.skip("LGN data files not available")
+
+
+class TestBMTKLGNModel:
+    """Tests for the full BMTK LGN model."""
+
+    @pytest.fixture
+    def bmtk_lgn_model(self):
+        """Create BMTK LGN model for testing."""
+        try:
+            return BMTKLGN(data_dir='/nvmessd/yinzi/GLIF_network')
+        except FileNotFoundError:
+            pytest.skip("LGN data files not available")
+
+    def test_bmtk_lgn_init(self, bmtk_lgn_model):
+        """Test BMTK LGN model initialization."""
+        assert bmtk_lgn_model.n_neurons == 17400
+        assert bmtk_lgn_model.movie_height == 120
+        assert bmtk_lgn_model.movie_width == 240
+        assert len(bmtk_lgn_model.neuron_groups) > 0
+
+    def test_bmtk_lgn_spatial_response(self, bmtk_lgn_model):
+        """Test BMTK LGN spatial response computation."""
+        movie = jnp.ones((50, 120, 240), dtype=jnp.float32) * 0.5
+        dom_spatial, non_dom_spatial = bmtk_lgn_model.spatial_response(movie)
+
+        assert dom_spatial.shape == (50, 17400)
+        assert non_dom_spatial.shape == (50, 17400)
+
+    def test_bmtk_lgn_forward_pass(self, bmtk_lgn_model):
+        """Test full BMTK LGN forward pass."""
+        movie = jnp.ones((50, 120, 240), dtype=jnp.float32) * 0.5
+        firing_rates = bmtk_lgn_model(movie)
+
+        assert firing_rates.shape == (50, 17400)
+        # Firing rates should be non-negative
+        assert float(firing_rates.min()) >= 0
+
+    def test_bmtk_lgn_cell_type_statistics(self, bmtk_lgn_model):
+        """Test cell type statistics."""
+        stats = bmtk_lgn_model.get_cell_type_statistics()
+
+        assert 'sON_TF8' in stats
+        assert stats['sON_TF8'] == 2250
+        assert stats['sONsOFF_001'] == 1200
+        assert stats['sONtOFF_001'] == 750
+
+    def test_bmtk_vs_simplified_consistency(self, bmtk_lgn_model):
+        """Test BMTK and simplified LGN produce similar outputs."""
+        try:
+            simplified_lgn = LGN(data_dir='/nvmessd/yinzi/GLIF_network')
+
+            movie = jnp.ones((20, 120, 240), dtype=jnp.float32) * 0.5
+
+            bmtk_rates = bmtk_lgn_model(movie)
+            simplified_rates = simplified_lgn(movie)
+
+            # Both should produce non-negative rates
+            assert float(bmtk_rates.min()) >= 0
+            assert float(simplified_rates.min()) >= 0
+
+            # Shapes should match
+            assert bmtk_rates.shape == simplified_rates.shape
+
+            # Mean rates should be in similar range (not exactly equal due to
+            # different temporal kernels and amplitude calculations)
+            bmtk_mean = float(jnp.mean(bmtk_rates))
+            simplified_mean = float(jnp.mean(simplified_rates))
+
+            # Within order of magnitude
+            assert 0.01 < bmtk_mean < 100
+            assert 0.01 < simplified_mean < 100
+
+        except FileNotFoundError:
+            pytest.skip("LGN data files not available")

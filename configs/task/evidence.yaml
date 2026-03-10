@@ -1,11 +1,30 @@
 # Evidence Accumulation Task Configuration
-# Evidence integration over time
+# Evidence integration over time for decision making
+# Reference: Chen et al., Science Advances 2022
 
 # Task identifier
 name: evidence
 
-# Number of output classes
+# Number of output classes (binary: left vs right)
 n_classes: 2
 
 # Task description
-description: "Evidence accumulation task for decision making"
+description: "Evidence accumulation task (left vs right decision)"
+
+# L5 Readout configuration (biologically realistic)
+# Uses two L5 pools (3 and 4) with competition
+readout:
+  # Use L5 pyramidal cell readout (true) or linear readout (false)
+  use_l5_readout: false
+
+  # Readout strategy: 'competition' for evidence task
+  strategy: competition
+
+  # Pool indices for competition readout (pools 3-4 for evidence)
+  pool_indices: [3, 4]
+
+  # Number of L5 readout populations to load
+  n_readout_populations: 15
+
+  # Number of L5 neurons per pool
+  neurons_per_class: 16

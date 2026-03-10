@@ -114,18 +114,42 @@ def weighted_crossentropy(
 ) -> Array:
     """Weighted cross-entropy loss.
 
+    Supports both 2D (batch, num_classes) and 3D (batch, n_chunks, num_classes) inputs.
+    For 3D inputs, the labels are broadcast across chunks.
+
     Args:
-        logits: Prediction logits (batch, num_classes)
+        logits: Prediction logits (batch, num_classes) or (batch, n_chunks, num_classes)
         labels: Integer class labels (batch,)
-        weights: Sample weights (batch,)
+        weights: Sample weights (batch,) or (batch, n_chunks)
         from_logits: If True, apply softmax to logits
 
     Returns:
         Weighted average cross-entropy loss (scalar)
     """
-    ce_loss = sparse_categorical_crossentropy(logits, labels, from_logits)
-    weighted_loss = ce_loss * weights
-    return jnp.sum(weighted_loss) / jnp.sum(weights)
+    # Handle 3D inputs (batch, n_chunks, num_classes)
+    if logits.ndim == 3:
+        batch_size, n_chunks, num_classes = logits.shape
+        # Flatten to (batch * n_chunks, num_classes)
+        logits_flat = logits.reshape(-1, num_classes)
+        # Broadcast labels to (batch * n_chunks,)
+        labels_flat = jnp.repeat(labels, n_chunks)
+        # Compute loss
+        ce_loss = sparse_categorical_crossentropy(logits_flat, labels_flat, from_logits)
+        # Reshape to (batch, n_chunks)
+        ce_loss = ce_loss.reshape(batch_size, n_chunks)
+        # Handle weights
+        if weights.ndim == 1:
+            # Broadcast weights to (batch, n_chunks)
+            weights_expanded = weights[:, None]
+            weighted_loss = ce_loss * weights_expanded
+            return jnp.sum(jnp.mean(weighted_loss, axis=1)) / jnp.sum(weights)
+        else:
+            weighted_loss = ce_loss * weights
+            return jnp.sum(weighted_loss) / jnp.sum(weights)
+    else:
+        ce_loss = sparse_categorical_crossentropy(logits, labels, from_logits)
+        weighted_loss = ce_loss * weights
+        return jnp.sum(weighted_loss) / jnp.sum(weights)
 
 
 def binary_crossentropy(

@@ -42,12 +42,15 @@ class TrainState(NamedTuple):
         opt_state: Optimizer state
         initial_params: Initial parameter values (for stiff regularization)
         rng_key: Random key for training
+        sign_masks: Boolean masks for Dale's law (True = excitatory, False = inhibitory).
+                   Keys: 'input_weights', 'recurrent_weights'. Based on initial weight signs.
     """
     step: int
     params: Dict[str, Array]
     opt_state: Any
     initial_params: Dict[str, Array]
     rng_key: Array
+    sign_masks: Dict[str, Array] = {}  # Default empty for backward compatibility
 
 
 class TrainMetrics(NamedTuple):
@@ -121,7 +124,7 @@ class V1Trainer:
     Example:
         >>> network = V1Network.from_billeh(network_path)
         >>> trainer = V1Trainer(network, config=TrainConfig())
-        >>> state = trainer.init_train_state(rng_key)
+        >>> state = trainer.init_train_state(rng_key, readout_params={'weights': w, 'bias': b})
         >>> for batch in dataloader:
         ...     state, metrics = trainer.train_step(state, batch, network_state)
     """
@@ -131,6 +134,7 @@ class V1Trainer:
         network: V1Network,
         config: Optional[TrainConfig] = None,
         target_firing_rates: Optional[Array] = None,
+        readout_config: Optional[Dict[str, Any]] = None,
     ):
         """Initialize trainer.
 
@@ -138,10 +142,16 @@ class V1Trainer:
             network: V1Network instance
             config: Training configuration
             target_firing_rates: Target firing rate distribution for rate regularization
+            readout_config: Readout layer configuration (temporal_pooling, chunk_size, apply_softmax)
         """
         self.network = network
         self.config = config or TrainConfig()
         self.target_firing_rates = target_firing_rates
+        self.readout_config = readout_config or {
+            'temporal_pooling': 'chunks',
+            'chunk_size': 50,
+            'apply_softmax': True,
+        }
 
         # Create optimizer
         self.optimizer = self._create_optimizer()
@@ -154,6 +164,96 @@ class V1Trainer:
             )
         else:
             self.rate_regularizer = None
+
+    def _apply_readout(
+        self,
+        spikes: Array,
+        weights: Array,
+        bias: Array,
+    ) -> Array:
+        """Apply readout layer with trainable parameters.
+
+        Args:
+            spikes: Spike trains (time, batch, n_neurons)
+            weights: Readout weights (n_neurons, n_classes)
+            bias: Readout bias (n_classes,)
+
+        Returns:
+            Predictions (batch, n_chunks, n_classes) or (batch, n_classes)
+        """
+        temporal_pooling = self.readout_config.get('temporal_pooling', 'chunks')
+        chunk_size = self.readout_config.get('chunk_size', 50)
+        apply_softmax = self.readout_config.get('apply_softmax', True)
+
+        # Temporal pooling
+        if temporal_pooling == 'mean':
+            pooled = jnp.mean(spikes, axis=0)  # (batch, n_neurons)
+        elif temporal_pooling == 'sum':
+            pooled = jnp.sum(spikes, axis=0)
+        elif temporal_pooling == 'last':
+            pooled = spikes[-1]
+        elif temporal_pooling == 'chunks':
+            seq_len = spikes.shape[0]
+            n_chunks = seq_len // chunk_size
+            # Reshape to (n_chunks, chunk_size, batch, n_neurons)
+            spikes_chunked = spikes.reshape(n_chunks, chunk_size, *spikes.shape[1:])
+            pooled = jnp.mean(spikes_chunked, axis=1)  # (n_chunks, batch, n_neurons)
+            # Transpose to (batch, n_chunks, n_neurons)
+            pooled = jnp.transpose(pooled, (1, 0, 2))
+        else:
+            raise ValueError(f"Unknown temporal_pooling: {temporal_pooling}")
+
+        # Linear projection
+        logits = pooled @ weights + bias
+
+        # Apply softmax if requested
+        if apply_softmax:
+            return jax.nn.softmax(logits, axis=-1)
+        return logits
+
+    def _apply_dale_constraints(
+        self,
+        params: Dict[str, Array],
+        sign_masks: Dict[str, Array],
+    ) -> Dict[str, Array]:
+        """Apply Dale's law constraints to parameters after gradient update.
+
+        Ensures that:
+        - Excitatory weights (sign_mask=True) are clipped to >= 0
+        - Inhibitory weights (sign_mask=False) are clipped to <= 0
+
+        This enforces the biological constraint that neurons are either
+        excitatory or inhibitory, never both (Dale's Law).
+
+        Args:
+            params: Current parameters (may violate Dale's law after gradient update)
+            sign_masks: Boolean masks from initial weights (True = excitatory)
+
+        Returns:
+            Constrained parameters satisfying Dale's law
+        """
+        if not self.config.use_dale_law:
+            return params
+
+        constrained_params = dict(params)
+
+        # Constrain input weights
+        if 'input_weights' in params and 'input_weights' in sign_masks:
+            constrained_params['input_weights'] = jnp.where(
+                sign_masks['input_weights'],
+                jnp.maximum(params['input_weights'], 0.0),  # Excitatory: >= 0
+                jnp.minimum(params['input_weights'], 0.0),  # Inhibitory: <= 0
+            )
+
+        # Constrain recurrent weights
+        if 'recurrent_weights' in params and 'recurrent_weights' in sign_masks:
+            constrained_params['recurrent_weights'] = jnp.where(
+                sign_masks['recurrent_weights'],
+                jnp.maximum(params['recurrent_weights'], 0.0),
+                jnp.minimum(params['recurrent_weights'], 0.0),
+            )
+
+        return constrained_params
 
     def _create_optimizer(self) -> optax.GradientTransformation:
         """Create optax optimizer with optional gradient clipping and warmup."""
@@ -188,17 +288,35 @@ class V1Trainer:
 
         return optax.chain(*transforms)
 
-    def init_train_state(self, rng_key: Array) -> TrainState:
+    def init_train_state(
+        self,
+        rng_key: Array,
+        readout_params: Optional[Dict[str, Array]] = None,
+    ) -> TrainState:
         """Initialize training state.
 
         Args:
             rng_key: Random key for initialization
+            readout_params: Optional readout layer parameters (weights, bias).
+                           If provided, these will be included in trainable params.
 
         Returns:
             Initial TrainState
         """
         # Get trainable parameters from network
         params = self.network.get_trainable_params()
+
+        # Compute sign masks from initial weights for Dale's law enforcement
+        # True = excitatory (weight >= 0), False = inhibitory (weight < 0)
+        sign_masks = {
+            'input_weights': params['input_weights'] >= 0,
+            'recurrent_weights': params['recurrent_weights'] >= 0,
+        }
+
+        # Add readout parameters if provided
+        if readout_params is not None:
+            params['readout_weights'] = readout_params['weights']
+            params['readout_bias'] = readout_params['bias']
 
         # Initialize optimizer state
         opt_state = self.optimizer.init(params)
@@ -212,6 +330,7 @@ class V1Trainer:
             opt_state=opt_state,
             initial_params=initial_params,
             rng_key=rng_key,
+            sign_masks=sign_masks,
         )
 
     def _compute_loss(
@@ -228,13 +347,13 @@ class V1Trainer:
         """Compute total loss including all regularization terms.
 
         Args:
-            params: Current trainable parameters
+            params: Current trainable parameters (includes readout_weights, readout_bias)
             initial_params: Initial parameters (for stiff regularization)
             inputs: Input tensor (seq_len, batch, n_inputs)
             labels: Target labels (batch,)
             sample_weights: Sample weights (batch,)
             network_state: Initial network state
-            readout_fn: Function to compute predictions from spikes
+            readout_fn: Function to compute predictions from spikes (used if no readout params)
             rng_key: Random key
 
         Returns:
@@ -252,22 +371,35 @@ class V1Trainer:
         output = updated_network(inputs, network_state, noise_key)
 
         # Compute predictions via readout
-        predictions = readout_fn(output.spikes)
+        # Use trainable readout params if available, otherwise use the provided function
+        if 'readout_weights' in params and 'readout_bias' in params:
+            predictions = self._apply_readout(
+                output.spikes,
+                params['readout_weights'],
+                params['readout_bias'],
+            )
+        else:
+            predictions = readout_fn(output.spikes)
 
         # Classification loss
+        # Note: When readout uses apply_softmax=True, predictions are probabilities
+        # and we should use from_logits=False. When apply_softmax=False, use from_logits=True.
+        # For TF alignment, readout should have apply_softmax=True.
         classification_loss = weighted_crossentropy(
-            predictions, labels, sample_weights, from_logits=True
+            predictions, labels, sample_weights, from_logits=False
         )
 
         # Voltage regularization
         if self.config.use_voltage_regularization:
+            # Use voltage_scale and voltage_offset from the network's GLIF3 params
+            # This normalizes voltages to 0-1 range before computing penalty
             voltage_loss = voltage_regularization(
                 output.voltages,
-                v_th=jnp.ones((self.network.n_neurons,)),  # Normalized
-                v_reset=jnp.zeros((self.network.n_neurons,)),
+                v_th=jnp.ones((self.network.n_neurons,)),  # Normalized threshold
+                v_reset=jnp.zeros((self.network.n_neurons,)),  # Normalized reset
                 voltage_cost=self.config.voltage_cost,
-                voltage_scale=self.config.voltage_scale,
-                voltage_offset=self.config.voltage_offset,
+                voltage_scale=self.network.glif3_params.voltage_scale,
+                voltage_offset=self.network.glif3_params.voltage_offset,
             )
         else:
             voltage_loss = jnp.array(0.0)
@@ -294,7 +426,13 @@ class V1Trainer:
         total_loss = classification_loss + voltage_loss + rate_loss + weight_loss
 
         # Compute accuracy
-        pred_classes = jnp.argmax(predictions, axis=-1)
+        # Handle 3D predictions (batch, n_chunks, n_classes)
+        if predictions.ndim == 3:
+            # Use the last chunk for accuracy (matching TF behavior)
+            predictions_last = predictions[:, -1, :]
+            pred_classes = jnp.argmax(predictions_last, axis=-1)
+        else:
+            pred_classes = jnp.argmax(predictions, axis=-1)
         correct = (pred_classes == labels).astype(jnp.float32)
         accuracy = jnp.sum(correct * sample_weights) / jnp.sum(sample_weights)
 
@@ -357,6 +495,10 @@ class V1Trainer:
         )
         new_params = optax.apply_updates(state.params, updates)
 
+        # Apply Dale's law constraints immediately after parameter update
+        # This ensures stored params always satisfy biological constraints
+        new_params = self._apply_dale_constraints(new_params, state.sign_masks)
+
         # Create new state
         new_state = TrainState(
             step=state.step + 1,
@@ -364,6 +506,7 @@ class V1Trainer:
             opt_state=new_opt_state,
             initial_params=state.initial_params,
             rng_key=new_key,
+            sign_masks=state.sign_masks,
         )
 
         return new_state, output, metrics

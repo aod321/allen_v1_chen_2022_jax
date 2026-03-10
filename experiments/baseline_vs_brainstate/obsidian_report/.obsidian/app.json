@@ -1,0 +1,8 @@
+{
+  "strictLineBreaks": true,
+  "showLineNumber": true,
+  "useTab": false,
+  "tabSize": 2,
+  "readableLineLength": true,
+  "attachmentFolderPath": "attachments"
+}

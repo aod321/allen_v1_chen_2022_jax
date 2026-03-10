@@ -12,17 +12,19 @@ The LGN model applies:
 Corresponding TF implementation: lgn_model/lgn.py:86-329
 """
 
-import os
-import pickle as pkl
-from dataclasses import dataclass
 from functools import partial
 from typing import Dict, Optional, Tuple
 
 import jax
 import jax.numpy as jnp
 import numpy as np
-import pandas as pd
 
+from .params_loader import (
+    LGNParams,
+    load_lgn_params,
+    load_lgn_params_from_dir,
+    get_neuron_groups,
+)
 from .spatial_filter import (
     SpatialFilter,
     bilinear_select,
@@ -35,136 +37,6 @@ from .temporal_filter import (
     temporal_filter,
     transfer_function,
 )
-
-
-@dataclass
-class LGNParams:
-    """Parameters for LGN neurons.
-
-    Attributes:
-        x: x-coordinates of neurons (n_neurons,)
-        y: y-coordinates of neurons (n_neurons,)
-        non_dominant_x: x-coordinates for non-dominant subunit (n_neurons,)
-        non_dominant_y: y-coordinates for non-dominant subunit (n_neurons,)
-        spatial_sizes: Spatial filter sizes (n_neurons,)
-        dom_amplitude: Amplitude for dominant subunit (n_neurons,)
-        non_dom_amplitude: Amplitude for non-dominant subunit (n_neurons,)
-        spontaneous_rates: Spontaneous firing rates (n_neurons,)
-        is_composite: Boolean flags for ON-OFF composite cells (n_neurons,)
-        dom_temporal_kernels: Temporal kernels for dominant subunit (n_neurons, kernel_length)
-        non_dom_temporal_kernels: Temporal kernels for non-dominant subunit (n_neurons, kernel_length)
-        model_id: Cell type identifiers (list of strings)
-    """
-    x: np.ndarray
-    y: np.ndarray
-    non_dominant_x: np.ndarray
-    non_dominant_y: np.ndarray
-    spatial_sizes: np.ndarray
-    dom_amplitude: np.ndarray
-    non_dom_amplitude: np.ndarray
-    spontaneous_rates: np.ndarray
-    is_composite: np.ndarray
-    dom_temporal_kernels: np.ndarray
-    non_dom_temporal_kernels: np.ndarray
-    model_id: list
-
-    @property
-    def n_neurons(self) -> int:
-        """Number of LGN neurons."""
-        return len(self.x)
-
-    @property
-    def kernel_length(self) -> int:
-        """Length of temporal kernels."""
-        return self.dom_temporal_kernels.shape[1]
-
-
-def load_lgn_params(
-    lgn_data_path: str,
-    cache_path: Optional[str] = None,
-) -> LGNParams:
-    """Load LGN parameters from CSV and cached temporal kernels.
-
-    Args:
-        lgn_data_path: Path to lgn_full_col_cells_3.csv
-        cache_path: Path to cached temporal kernels (temporal_kernels.pkl)
-                   If None, looks in same directory as lgn_data_path
-
-    Returns:
-        LGNParams containing all neuron parameters
-
-    Note:
-        Corresponding TF: LGN.__init__ (lgn.py:86-263)
-    """
-    # Load CSV data
-    d = pd.read_csv(lgn_data_path, delimiter=' ')
-
-    spatial_sizes = d['spatial_size'].to_numpy()
-    model_id = d['model_id'].to_list()
-    x = d['x'].to_numpy()
-    y = d['y'].to_numpy()
-
-    # Determine amplitude from cell type
-    amplitude = np.array([1. if 'ON' in a else -1. for a in model_id])
-    non_dom_amplitude = np.zeros_like(amplitude)
-    is_composite = np.array(['ON' in a and 'OFF' in a for a in model_id]).astype(float)
-
-    # Initialize non-dominant coordinates
-    non_dominant_x = np.zeros_like(x)
-    non_dominant_y = np.zeros_like(y)
-
-    # Load temporal kernels from cache
-    if cache_path is None:
-        root_path = os.path.dirname(lgn_data_path)
-        cache_path = os.path.join(root_path, 'temporal_kernels.pkl')
-
-    if not os.path.exists(cache_path):
-        raise FileNotFoundError(
-            f"Temporal kernels cache not found at {cache_path}. "
-            "Please run the TensorFlow LGN model first to generate this cache."
-        )
-
-    with open(cache_path, 'rb') as f:
-        cached = pkl.load(f)
-
-    dom_temporal_kernels = cached['dom_temporal_kernels']
-    non_dom_temporal_kernels = cached['non_dom_temporal_kernels']
-    non_dominant_x = cached['non_dominant_x']
-    non_dominant_y = cached['non_dominant_y']
-    amplitude = cached['amplitude']
-    non_dom_amplitude = cached['non_dom_amplitude']
-    spontaneous_rates = cached['spontaneous_firing_rates']
-
-    # Normalize coordinates to movie dimensions
-    # Following TF: x = x * 239 / 240, y = y * 119 / 120
-    x_normalized = x * 239 / 240
-    y_normalized = y * 119 / 120
-
-    # Clip to valid range
-    x_normalized[np.floor(x_normalized) < 0] = 0.
-    y_normalized[np.floor(y_normalized) < 0] = 0.
-
-    non_dominant_x_normalized = non_dominant_x * 239 / 240
-    non_dominant_y_normalized = non_dominant_y * 119 / 120
-    non_dominant_x_normalized[np.floor(non_dominant_x_normalized) < 0] = 0.
-    non_dominant_y_normalized[np.floor(non_dominant_y_normalized) < 0] = 0.
-    non_dominant_x_normalized[np.ceil(non_dominant_x_normalized) >= 239.] = 239. - 1e-6
-    non_dominant_y_normalized[np.ceil(non_dominant_y_normalized) >= 119.] = 119. - 1e-6
-
-    return LGNParams(
-        x=x_normalized.astype(np.float32),
-        y=y_normalized.astype(np.float32),
-        non_dominant_x=non_dominant_x_normalized.astype(np.float32),
-        non_dominant_y=non_dominant_y_normalized.astype(np.float32),
-        spatial_sizes=spatial_sizes.astype(np.float32),
-        dom_amplitude=amplitude.astype(np.float32),
-        non_dom_amplitude=non_dom_amplitude.astype(np.float32),
-        spontaneous_rates=spontaneous_rates.astype(np.float32),
-        is_composite=is_composite.astype(np.float32),
-        dom_temporal_kernels=dom_temporal_kernels.astype(np.float32),
-        non_dom_temporal_kernels=non_dom_temporal_kernels.astype(np.float32),
-        model_id=model_id,
-    )
 
 
 class LGN:
@@ -192,28 +64,33 @@ class LGN:
         self,
         lgn_data_path: Optional[str] = None,
         params: Optional[LGNParams] = None,
+        data_dir: Optional[str] = None,
         movie_height: int = 120,
         movie_width: int = 240,
     ):
         """Initialize LGN model.
 
         Args:
-            lgn_data_path: Path to LGN data CSV file. If None, uses default path.
+            lgn_data_path: Path to LGN data CSV file. If None, uses data_dir or default.
             params: Pre-loaded LGNParams. If provided, lgn_data_path is ignored.
+            data_dir: Data directory containing LGN files (e.g., GLIF_network).
+                     Used for flexible file discovery.
             movie_height: Height of input movies
             movie_width: Width of input movies
 
         Note:
-            Either lgn_data_path or params must be provided.
+            At least one of params, lgn_data_path, or data_dir must be provided.
         """
         if params is not None:
             self.params = params
+        elif data_dir is not None:
+            self.params = load_lgn_params_from_dir(data_dir, movie_height, movie_width)
         elif lgn_data_path is not None:
-            self.params = load_lgn_params(lgn_data_path)
+            self.params = load_lgn_params(lgn_data_path, movie_height=movie_height, movie_width=movie_width)
         else:
             # Use default path
             default_path = '/nvmessd/yinzi/lgn_full_col_cells_3.csv'
-            self.params = load_lgn_params(default_path)
+            self.params = load_lgn_params(default_path, movie_height=movie_height, movie_width=movie_width)
 
         self.movie_height = movie_height
         self.movie_width = movie_width
@@ -232,26 +109,7 @@ class LGN:
         self.non_dom_temporal_kernels = jnp.array(self.params.non_dom_temporal_kernels)
 
         # Set up neuron groups for spatial filtering
-        self._setup_neuron_groups()
-
-    def _setup_neuron_groups(self):
-        """Group neurons by spatial size for efficient filtering.
-
-        Creates a list of (indices, sigma) tuples, one per spatial size bin.
-        """
-        spatial_sizes_np = np.array(self.params.spatial_sizes)
-        spatial_range = np.arange(0, 15, 1.0)
-
-        self.neuron_groups = []
-        for i in range(len(spatial_range) - 1):
-            low, high = spatial_range[i], spatial_range[i + 1]
-            mask = (spatial_sizes_np >= low) & (spatial_sizes_np < high)
-            indices = np.where(mask)[0]
-
-            if len(indices) > 0:
-                sigma = (low + high) / 2.0 / 3.0
-                sigma = max(sigma, 0.5)
-                self.neuron_groups.append((indices, sigma))
+        self.neuron_groups = get_neuron_groups(np.array(self.params.spatial_sizes))
 
     @property
     def n_neurons(self) -> int:

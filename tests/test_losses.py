@@ -290,3 +290,71 @@ class TestMeanSquaredError:
         result = mean_squared_error(pred, target)
 
         assert result.shape == (16,)
+
+
+# =============================================================================
+# Garrett Firing Rates Tests
+# =============================================================================
+
+
+class TestGarrettFiringRates:
+    """Tests for Garrett firing rate loading and interpolation."""
+
+    def test_load_garrett_firing_rates(self):
+        """Test loading Garrett firing rates from file."""
+        from v1_jax.data.network_loader import load_garrett_firing_rates
+
+        try:
+            rates = load_garrett_firing_rates('/nvmessd/yinzi/GLIF_network')
+
+            # Full network has 51978 neurons
+            assert rates.shape == (51978,)
+            assert rates.dtype == np.float32
+
+            # Rates should be sorted (for quantile matching)
+            assert np.all(np.diff(rates) >= 0)
+
+            # Rates should be non-negative
+            assert rates.min() >= 0
+        except FileNotFoundError:
+            pytest.skip("Garrett firing rates file not available")
+
+    def test_load_garrett_with_interpolation(self):
+        """Test loading with interpolation to different neuron count."""
+        from v1_jax.data.network_loader import load_garrett_firing_rates
+
+        try:
+            n_neurons = 1000
+            rates = load_garrett_firing_rates(
+                '/nvmessd/yinzi/GLIF_network',
+                n_neurons=n_neurons
+            )
+
+            assert rates.shape == (n_neurons,)
+            assert rates.dtype == np.float32
+
+            # Interpolated rates should still be sorted
+            assert np.all(np.diff(rates) >= 0)
+        except FileNotFoundError:
+            pytest.skip("Garrett firing rates file not available")
+
+    def test_rate_distribution_regularizer(self):
+        """Test SpikeRateDistributionRegularizer integration."""
+        from v1_jax.training.regularizers import SpikeRateDistributionRegularizer
+
+        n_neurons = 100
+        target_rates = jnp.linspace(0.01, 0.05, n_neurons)
+
+        reg = SpikeRateDistributionRegularizer(
+            target_rates=target_rates,
+            rate_cost=1.0,
+        )
+
+        # Test with mock spikes
+        spikes = jnp.ones((4, 100, n_neurons)) * 0.02
+        key = jax.random.PRNGKey(42)
+
+        loss = reg(spikes, key)
+
+        assert loss.shape == ()
+        assert float(loss) >= 0

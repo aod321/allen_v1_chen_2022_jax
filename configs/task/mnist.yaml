@@ -1,0 +1,43 @@
+# MNIST Task Configuration
+# 10-class handwritten digit classification
+
+# Task identifier
+name: mnist
+
+# Number of output classes
+n_classes: 10
+
+# Task description
+description: "MNIST handwritten digit classification (10 classes)"
+
+# MNIST-specific settings
+mnist:
+  # Stimulus timing (ms)
+  pre_delay: 50
+  im_slice: 100
+  post_delay: 450
+
+  # Input intensity scaling
+  intensity: 1.0
+
+  # Use rate-coded input (True) or binary spikes (False)
+  current_input: true
+
+# Readout configuration
+# Chen et al. 2022 uses L5 pyramidal cells for biologically realistic readout
+readout:
+  # Use L5 pyramidal cell voting readout (true) or linear readout (false)
+  use_l5_readout: false
+
+  # Whether to use spatially localized L5 neurons
+  localized_readout: true
+
+  # Number of L5 readout populations (15 spatial positions)
+  n_readout_populations: 15
+
+  # Number of L5 neurons per class pool
+  neurons_per_class: 16
+
+  # Offset into readout populations for 10-class task
+  # Classes 0-9 use populations 5-14
+  class_offset: 5

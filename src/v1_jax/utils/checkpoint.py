@@ -108,16 +108,59 @@ class CheckpointManager:
         Returns:
             True if checkpoint was saved
         """
+        # Handle pmap replicated arrays - take first device's value
+        def to_scalar(x):
+            """Convert potentially replicated array to scalar."""
+            if hasattr(x, 'ndim') and x.ndim > 0:
+                return int(x.flatten()[0])
+            return int(x)
+
         if step is None:
-            step = int(train_state.step)
+            step = to_scalar(train_state.step)
 
         # Prepare checkpoint data
+        # For pmap mode, take first device's values
+        def unreplicate(x):
+            """Take first device's value if replicated."""
+            if hasattr(x, 'ndim') and x.ndim > 0 and hasattr(x, 'shape'):
+                # Check if this looks like a replicated array (first dim = num_devices)
+                # For step/rng_key, just take first element
+                return x[0] if x.ndim >= 1 else x
+            return x
+
+        # Unreplicate params/state if in pmap mode (first dim = num_devices)
+        def unreplicate_param(v):
+            """Unreplicate parameter array if needed."""
+            arr = np.array(v)
+            # Heuristic: if first dim is small (<=8) and doesn't match expected param shape,
+            # assume it's replicated across devices
+            if arr.ndim > 1 and arr.shape[0] <= 8:
+                # Check if this looks like (num_devices, ...) replication
+                # by seeing if first dim values are all the same
+                if np.allclose(arr[0], arr[1:].mean(axis=0), rtol=1e-5, atol=1e-8):
+                    return arr[0]
+            return arr
+
+        def unreplicate_tree(tree):
+            """Unreplicate a pytree."""
+            return jax.tree.map(unreplicate_param, tree)
+
+        rng_key = np.array(train_state.rng_key)
+        if rng_key.ndim > 1:
+            rng_key = rng_key[0]
+
+        # Handle sign_masks (may be empty dict for backward compatibility)
+        sign_masks_data = {}
+        if hasattr(train_state, 'sign_masks') and train_state.sign_masks:
+            sign_masks_data = {k: unreplicate_param(v) for k, v in train_state.sign_masks.items()}
+
         ckpt_data = {
-            'step': int(train_state.step),
-            'params': {k: np.array(v) for k, v in train_state.params.items()},
-            'opt_state': jax.tree.map(np.array, train_state.opt_state),
-            'initial_params': {k: np.array(v) for k, v in train_state.initial_params.items()},
-            'rng_key': np.array(train_state.rng_key),
+            'step': to_scalar(train_state.step),
+            'params': {k: unreplicate_param(v) for k, v in train_state.params.items()},
+            'opt_state': unreplicate_tree(train_state.opt_state),
+            'initial_params': {k: unreplicate_param(v) for k, v in train_state.initial_params.items()},
+            'rng_key': rng_key,
+            'sign_masks': sign_masks_data,  # Dale's law sign masks
         }
 
         # Save checkpoint
@@ -160,6 +203,17 @@ class CheckpointManager:
         # Restore checkpoint data
         ckpt_data = self.manager.restore(step)
 
+        # Handle sign_masks with backward compatibility for old checkpoints
+        if 'sign_masks' in ckpt_data and ckpt_data['sign_masks']:
+            # Restore saved sign masks
+            sign_masks = {k: jnp.array(v) for k, v in ckpt_data['sign_masks'].items()}
+        else:
+            # Backward compatibility: compute sign masks from initial_params
+            sign_masks = {
+                'input_weights': jnp.array(ckpt_data['initial_params']['input_weights']) >= 0,
+                'recurrent_weights': jnp.array(ckpt_data['initial_params']['recurrent_weights']) >= 0,
+            }
+
         # Reconstruct TrainState
         train_state = TrainState(
             step=int(ckpt_data['step']),
@@ -167,6 +221,7 @@ class CheckpointManager:
             opt_state=jax.tree.map(jnp.array, ckpt_data['opt_state']) if not params_only else None,
             initial_params={k: jnp.array(v) for k, v in ckpt_data['initial_params'].items()},
             rng_key=jnp.array(ckpt_data['rng_key']),
+            sign_masks=sign_masks,
         )
 
         # Try to restore config

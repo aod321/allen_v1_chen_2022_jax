@@ -144,6 +144,8 @@ class GLIF3Cell:
         # Time constants
         tau = node_params['C_m'] / node_params['g']
         decay_type = jnp.exp(-dt / tau)
+        # Current to voltage factor (matching TF: no voltage_scale normalization)
+        # Note: weights are already normalized by voltage_scale in prepare_*_connectivity
         current_factor_type = 1 / node_params['C_m'] * (1 - jnp.exp(-dt / tau)) * tau
 
         # Synaptic parameters (4 receptors)
@@ -469,3 +471,121 @@ def glif3_unroll(
     )
 
     return final_state, all_spikes, all_voltages
+
+
+def glif3_unroll_checkpointed(
+    params: GLIF3Params,
+    initial_state: GLIF3State,
+    inputs: Array,
+    recurrent_fn,
+    n_neurons: int,
+    n_receptors: int,
+    max_delay: int,
+    dt: float = 1.0,
+    gauss_std: float = 0.5,
+    dampening_factor: float = 0.3,
+    checkpoint_every_n_steps: int = 50,
+) -> Tuple[GLIF3State, Array, Array]:
+    """Unroll GLIF3 dynamics with gradient checkpointing to reduce memory.
+
+    This function trades compute for memory by not storing intermediate
+    activations during forward pass. Instead, it recomputes them during
+    backward pass. The sequence is divided into segments, and each segment
+    is checkpointed.
+
+    Args:
+        params: Neuron parameters
+        initial_state: Initial state
+        inputs: External inputs, shape (time, batch, n_neurons * n_receptors)
+        recurrent_fn: Function (z_buf) -> recurrent_current
+        n_neurons: Number of neurons
+        n_receptors: Number of receptor types
+        max_delay: Maximum delay
+        dt: Time step
+        gauss_std: Surrogate gradient width
+        dampening_factor: Surrogate gradient amplitude
+        checkpoint_every_n_steps: Number of steps per checkpoint segment.
+            Smaller values save more memory but increase recomputation.
+            Recommended: 50-100 for ~51K neurons.
+
+    Returns:
+        Tuple of (final_state, all_spikes, all_voltages)
+        where all_spikes has shape (time, batch, n_neurons)
+        and all_voltages has shape (time, batch, n_neurons)
+    """
+    seq_len = inputs.shape[0]
+
+    # Define the step function (same as in glif3_unroll)
+    def scan_fn(state, inp):
+        rec_current = recurrent_fn(state.z_buf)
+        new_state, spikes, voltage = glif3_step(
+            params, state, inp, rec_current,
+            n_neurons, n_receptors, max_delay, dt, gauss_std, dampening_factor
+        )
+        return new_state, (spikes, voltage)
+
+    # Define a checkpointed segment function
+    @jax.checkpoint
+    def process_segment(state, segment_inputs):
+        """Process a segment of timesteps with checkpointing.
+
+        The @jax.checkpoint decorator causes JAX to:
+        - Not save intermediate activations during forward pass
+        - Recompute them during backward pass
+        """
+        final_state, (spikes, voltages) = jax.lax.scan(
+            scan_fn, state, segment_inputs
+        )
+        return final_state, (spikes, voltages)
+
+    # If sequence is short enough, just use one checkpoint
+    if seq_len <= checkpoint_every_n_steps:
+        return process_segment(initial_state, inputs)[0], *process_segment(initial_state, inputs)[1]
+
+    # Split inputs into segments
+    n_full_segments = seq_len // checkpoint_every_n_steps
+    remainder = seq_len % checkpoint_every_n_steps
+
+    # Process full segments
+    def segment_scan_fn(state, segment_idx):
+        """Process one segment."""
+        start = segment_idx * checkpoint_every_n_steps
+        segment_inputs = jax.lax.dynamic_slice(
+            inputs,
+            (start, 0, 0),
+            (checkpoint_every_n_steps, inputs.shape[1], inputs.shape[2])
+        )
+        new_state, (spikes, voltages) = process_segment(state, segment_inputs)
+        return new_state, (spikes, voltages)
+
+    # Use scan over segments for efficiency
+    state = initial_state
+    all_spikes_list = []
+    all_voltages_list = []
+
+    # Process full segments using a Python loop (JAX will trace it)
+    # We use a for loop here because the number of segments is known at trace time
+    for i in range(n_full_segments):
+        start = i * checkpoint_every_n_steps
+        segment_inputs = inputs[start:start + checkpoint_every_n_steps]
+        state, (seg_spikes, seg_voltages) = process_segment(state, segment_inputs)
+        all_spikes_list.append(seg_spikes)
+        all_voltages_list.append(seg_voltages)
+
+    # Process remainder if any
+    if remainder > 0:
+        remainder_inputs = inputs[n_full_segments * checkpoint_every_n_steps:]
+        # For remainder, we still checkpoint but with a smaller segment
+        @jax.checkpoint
+        def process_remainder(state, rem_inputs):
+            return jax.lax.scan(scan_fn, state, rem_inputs)
+
+        state, (rem_spikes, rem_voltages) = process_remainder(state, remainder_inputs)
+        all_spikes_list.append(rem_spikes)
+        all_voltages_list.append(rem_voltages)
+
+    # Concatenate all outputs
+    all_spikes = jnp.concatenate(all_spikes_list, axis=0)
+    all_voltages = jnp.concatenate(all_voltages_list, axis=0)
+
+    return state, all_spikes, all_voltages

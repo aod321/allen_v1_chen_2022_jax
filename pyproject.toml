@@ -24,6 +24,10 @@ dependencies = [
     "bmtk>=1.1.4",
     "hydra-core>=1.3.0",
     "omegaconf>=2.3.0",
+    "brainevent>=0.0.6",
+    "brainstate>=0.2.10",
+    "warp-lang>=1.12.0",
+    "braintrace>=0.1.2",
 ]
 
 [project.optional-dependencies]

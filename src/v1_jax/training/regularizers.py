@@ -50,7 +50,7 @@ def voltage_regularization(
     # Penalty for voltages below reset (using -1.0 as normalized reset)
     v_neg = jnp.square(jax.nn.relu(-voltage_32 + 1.0))
 
-    # Mean over batch and time, sum over neurons
+    # Sum over neurons, mean over batch and time - matches TF implementation
     voltage_loss = jnp.mean(jnp.sum(v_pos + v_neg, axis=-1))
 
     return voltage_cost * voltage_loss
@@ -86,6 +86,7 @@ def voltage_regularization_v2(
     # Penalty for voltages too far below reset
     v_neg = jnp.square(jnp.clip(jax.nn.relu(-voltages + v_reset - diff), 0.0, 1.0))
 
+    # Sum over neurons, mean over batch and time - matches TF implementation
     voltage_loss = jnp.mean(jnp.sum(v_pos + v_neg, axis=-1))
 
     return voltage_cost * voltage_loss

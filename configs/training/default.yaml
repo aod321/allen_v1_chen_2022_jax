@@ -1,20 +1,36 @@
 # Training Configuration
 # Defines optimizer and training hyperparameters
+#
+# NOTE: This project uses brainstate + brainevent + braintrace for training.
+# - Forward: brainevent.EventArray @ CSR (event-driven spike propagation)
+# - Gradient: braintrace.IODim (online eligibility traces, NOT BPTT)
+#
+# BPTT is intentionally NOT supported. IODim provides:
+# - 500x lower memory usage (eligibility traces vs stored activations)
+# - Similar convergence in practice
 
 # Number of training epochs
-n_epochs: 100
+n_epochs: 30
 
 # Batch size per device
-batch_size: 2
+batch_size: 32
 
 # Sequence length (timesteps)
 seq_len: 600
 
-# Training steps per epoch
-steps_per_epoch: 100
+# Training steps per epoch (200 steps × 32 batch = 6,400 samples/epoch)
+steps_per_epoch: 200
 
 # Validation steps
 val_steps: 20
+
+# =============================================================================
+# IODim (braintrace) Configuration
+# =============================================================================
+# Eligibility trace decay factor (0.9-0.999)
+# Higher = more accurate gradient estimate but slower
+# Recommended: 0.99 for most tasks
+etrace_decay: 0.99
 
 # =============================================================================
 # Optimizer
@@ -25,11 +41,8 @@ learning_rate: 1e-3
 # Gradient clipping norm
 gradient_clip_norm: 1.0
 
-# Weight decay (AdamW)
-weight_decay: 0.0
-
-# Warmup steps for learning rate schedule
-warmup_steps: 0
+# Optimizer type (Adam, SGD, etc.)
+optimizer: Adam
 
 # =============================================================================
 # Regularization
@@ -42,3 +55,15 @@ voltage_cost: 1e-5
 
 # Weight regularization coefficient
 weight_cost: 0.0
+
+# =============================================================================
+# Spike Rate Distribution Regularization (Garrett et al.)
+# =============================================================================
+# Enable rate distribution regularization to match Garrett firing rates
+use_rate_distribution: true
+
+# Rate distribution regularization coefficient
+rate_distribution_cost: 0.1
+
+# Huber loss delta parameter (robustness to outliers)
+huber_delta: 0.001
